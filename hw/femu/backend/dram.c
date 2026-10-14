@@ -1,4 +1,5 @@
 #include <sys/syscall.h>
+#include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/statvfs.h>
 #include "../nvme.h"
@@ -74,21 +75,54 @@ int femu_mbe_parse_type(const char *name, FemuMbeType *type, Error **errp)
     return 0;
 }
 
-/* CAP_IPC_LOCK lifts RLIMIT_MEMLOCK; read it without a libcap dependency */
-static bool mbe_has_ipc_lock(void)
+#define MBE_CAP_IPC_LOCK (1ull << 14)
+
+/* one capability set of this process; read without a libcap dependency */
+static uint64_t mbe_cap_set(const char *field)
 {
     g_autofree char *status = NULL;
+    g_autofree char *key = g_strdup_printf("\n%s:", field);
     const char *cap, *end;
-    uint64_t eff;
+    uint64_t set;
 
     if (!g_file_get_contents("/proc/self/status", &status, NULL, NULL)) {
-        return false;
+        return 0;
     }
-    cap = strstr(status, "\nCapEff:");
-    if (!cap || qemu_strtou64(cap + strlen("\nCapEff:"), &end, 16, &eff)) {
-        return false;
+    cap = strstr(status, key);
+    if (!cap || qemu_strtou64(cap + strlen(key), &end, 16, &set)) {
+        return 0;
     }
-    return eff & (1ull << 14 /* CAP_IPC_LOCK */);
+    return set;
+}
+
+/* CAP_IPC_LOCK lifts RLIMIT_MEMLOCK */
+static bool mbe_has_ipc_lock(void)
+{
+    return mbe_cap_set("CapEff") & MBE_CAP_IPC_LOCK;
+}
+
+/*
+ * A binary given CAP_IPC_LOCK with setcap, the way to pin without a raised
+ * memlock limit, runs non-dumpable, which makes /proc/self/pagemap root's
+ * and unreadable to the process itself: a sparse backend could no longer
+ * count its resident and swapped pages, nor tools the user runs read its
+ * smaps. When the process holds no other capability and is not set-id,
+ * being dumpable exposes nothing: the same user may run the binary and get
+ * the same capability anyway. Then make it dumpable again; leave every
+ * other case as the kernel set it.
+ */
+static void mbe_restore_dumpable(void)
+{
+    if (prctl(PR_GET_DUMPABLE) == 1 ||
+        mbe_cap_set("CapPrm") != MBE_CAP_IPC_LOCK ||
+        getuid() != geteuid() || getgid() != getegid()) {
+        return;
+    }
+    if (prctl(PR_SET_DUMPABLE, 1)) {
+        warn_report("femu: cannot make QEMU dumpable again after setcap "
+                    "(%s): a sparse backend counts its pages with mincore()",
+                    strerror(errno));
+    }
 }
 
 /* Locking more than the limit fails, now or at some later allocation. */
@@ -479,6 +513,7 @@ int init_dram_backend(SsdDramBackend **mbe, int64_t nbytes,
         return 0;
     }
 
+    mbe_restore_dumpable();
     if (mbe_pin_process(cfg->pin_meta, errp)) {
         return -1;
     }

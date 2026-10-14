@@ -30,6 +30,10 @@
 # locked memory counts against memory.max too. Pinning needs RLIMIT_MEMLOCK
 # unlimited: once, as root, add "USER - memlock unlimited" to
 # /etc/security/limits.conf, or setcap cap_ipc_lock+ep on qemu-system-x86_64.
+# setcap needs redoing after every relink, and a QEMU holding a capability
+# its user does not have refuses that user's sched_setaffinity on its threads
+# and ptrace-style reads of /proc/PID/smaps: pinning threads (pin.sh) then
+# needs sudo. The limits.conf way has neither catch.
 
 set -euo pipefail
 

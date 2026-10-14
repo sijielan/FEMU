@@ -31908,11 +31908,26 @@ static void femu_test_geometry_2t(void *obj, void *data, QGuestAllocator *unused
     qtest_pc_shutdown(qs);
 }
 
+/* whether QEMU holds CAP_IPC_LOCK, e.g. from setcap on its binary */
+static bool femu_has_ipc_lock(pid_t pid)
+{
+    g_autofree char *path = g_strdup_printf("/proc/%d/status", pid);
+    g_autofree char *status = NULL;
+    const char *cap;
+
+    if (!g_file_get_contents(path, &status, NULL, NULL)) {
+        return false;
+    }
+    cap = strstr(status, "\nCapEff:");
+    return cap && (g_ascii_strtoull(cap + strlen("\nCapEff:"), NULL, 16) &
+                   (1ull << 14 /* CAP_IPC_LOCK */));
+}
+
 /*
  * A user without the memlock limit pinning needs still runs a sparse
  * backend by default: mbe_pin_meta=auto warns and runs unpinned. With
  * mbe_pin_meta=on the controller pins or refuses to start, whichever the
- * limit allows.
+ * limit, or CAP_IPC_LOCK on QEMU, allows.
  */
 static void femu_test_mbe_pin_auto(void *obj, void *data,
                                    QGuestAllocator *alloc)
@@ -31922,7 +31937,8 @@ static void femu_test_mbe_pin_auto(void *obj, void *data,
     struct rlimit rl;
     bool can_pin = geteuid() == 0 ||
                    (!getrlimit(RLIMIT_MEMLOCK, &rl) &&
-                    rl.rlim_cur == RLIM_INFINITY);
+                    rl.rlim_cur == RLIM_INFINITY) ||
+                   femu_has_ipc_lock(qtest_pid(qts));
     QOSState *qs = qtest_pc_boot("-machine pc -nodefaults -device femu,"
                                  "id=mbe,addr=5,devsz_mb=64,femu_mode=2,"
                                  "mbe_type=sparse");
