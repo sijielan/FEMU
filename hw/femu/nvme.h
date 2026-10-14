@@ -2447,6 +2447,7 @@ typedef struct FemuCtrl {
     QemuCond        copy_cond;
     QSIMPLEQ_HEAD(, NvmeRequest) copy_queue;
     uint64_t        copy_inflight;  /* requests a copy thread still owes */
+    uint32_t        copy_queued;    /* of those, not yet taken by a thread */
     bool            copy_stopping;
     char            *precond;   /* bbssd state to write at realize */
     uint64_t        precond_seed;

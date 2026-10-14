@@ -1,5 +1,6 @@
 #include "./nvme.h"
 #include "nvme-pi.h"
+#include "qemu/processor.h"
 
 static int64_t nvme_io_clock(FemuCtrl *n)
 {
@@ -225,6 +226,14 @@ static inline void nvme_copy_cmd(NvmeCmd *dst, NvmeCmd *src)
  * before the data is in the guest's buffer or out of it. A pause waits for
  * the copies in flight, so nothing an admin command frees is still in use.
  */
+/*
+ * How long an idle copy thread watches the queue before it sleeps. Waking a
+ * sleeping thread takes several to tens of microseconds, which would land on
+ * the copies that have the least time to spare: a read's data is due when
+ * its NAND read is.
+ */
+#define NVME_COPY_SPIN_NS   50000
+
 static void *nvme_copy_thread(void *opaque)
 {
     FemuCtrl *n = opaque;
@@ -236,6 +245,18 @@ static void *nvme_copy_thread(void *opaque)
         int64_t t0;
         int ret;
 
+        if (!n->copy_stopping && QSIMPLEQ_EMPTY(&n->copy_queue)) {
+            int64_t until = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
+                            NVME_COPY_SPIN_NS;
+
+            qemu_mutex_unlock(&n->copy_lock);
+            while (!qatomic_read(&n->copy_queued) &&
+                   !qatomic_read(&n->copy_stopping) &&
+                   qemu_clock_get_ns(QEMU_CLOCK_REALTIME) < until) {
+                cpu_relax();
+            }
+            qemu_mutex_lock(&n->copy_lock);
+        }
         while (!n->copy_stopping && QSIMPLEQ_EMPTY(&n->copy_queue)) {
             qemu_cond_wait(&n->copy_cond, &n->copy_lock);
         }
@@ -244,6 +265,7 @@ static void *nvme_copy_thread(void *opaque)
             break;
         }
         QSIMPLEQ_REMOVE_HEAD(&n->copy_queue, copy_entry);
+        qatomic_dec(&n->copy_queued);
         qemu_mutex_unlock(&n->copy_lock);
 
         t0 = n->stage_sets ? nvme_io_clock(n) : 0;
@@ -270,6 +292,7 @@ void nvme_queue_copy(FemuCtrl *n, NvmeRequest *req, uint64_t off)
     qatomic_inc(&n->copy_inflight);
     qemu_mutex_lock(&n->copy_lock);
     QSIMPLEQ_INSERT_TAIL(&n->copy_queue, req, copy_entry);
+    qatomic_inc(&n->copy_queued);
     qemu_cond_signal(&n->copy_cond);
     qemu_mutex_unlock(&n->copy_lock);
 }
@@ -285,6 +308,7 @@ void nvme_start_copy_threads(FemuCtrl *n)
     qemu_cond_init(&n->copy_cond);
     QSIMPLEQ_INIT(&n->copy_queue);
     n->copy_inflight = 0;
+    n->copy_queued = 0;
     n->copy_stopping = false;
     n->copy_threads = g_new0(QemuThread, n->async_copy);
     for (int i = 0; i < n->async_copy; i++) {
@@ -300,7 +324,7 @@ void nvme_stop_copy_threads(FemuCtrl *n)
         return;
     }
     qemu_mutex_lock(&n->copy_lock);
-    n->copy_stopping = true;
+    qatomic_set(&n->copy_stopping, true);
     qemu_cond_broadcast(&n->copy_cond);
     qemu_mutex_unlock(&n->copy_lock);
     for (int i = 0; i < n->async_copy; i++) {
