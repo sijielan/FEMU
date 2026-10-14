@@ -1661,6 +1661,8 @@ enum {
     FEMU_STAGE_POST_DELAY,      /* ready to the posted entry */
     FEMU_STAGE_TOTAL,           /* fetch to the posted entry */
     FEMU_STAGE_PAST_DUE,        /* due time to the posted entry; not in total */
+    FEMU_STAGE_COPY_READ,       /* backend copy of a read, inside submit */
+    FEMU_STAGE_COPY_WRITE,      /* backend copy of a write, inside submit */
     FEMU_STAGE_NR,
 };
 
@@ -1705,6 +1707,8 @@ typedef struct NvmeRequest {
     QEMUIOVector            iov;
     QTAILQ_ENTRY(NvmeRequest)entry;
     int64_t                 stime;
+    /* io_stages: how long the backend copy took, -1 for none */
+    int64_t                 t_copy;
     /* io_stages: when the poller handed it to the FTL ring, and got it back */
     int64_t                 t_handoff;
     int64_t                 t_return;

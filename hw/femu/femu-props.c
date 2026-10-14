@@ -777,6 +777,16 @@ static const FemuPropDesc femu_ctrl_runtime_descs[] = {
     { "tag-skipped",
       "Read-only: logical pages read that tag_check could not check, as "
       "their last change was a Copy or failed" },
+    { "mbe-swapped",
+      "Read-only: bytes of a mbe_type=sparse backend the host has swapped "
+      "out, to zswap or a swap device (pagemap); 0 for other types" },
+    { "mbe-zswap-pool",
+      "Read-only: bytes of the zswap pool charged to QEMU's memory cgroup "
+      "(memory.stat zswap); with mbe_pin_meta only backend data is there" },
+    { "mbe-zswapped",
+      "Read-only: bytes of pages that pool holds before compression "
+      "(memory.stat zswapped); divided by mbe-zswap-pool, the compression "
+      "ratio" },
     { "mbe-evicted",
       "Read-only: bytes of backend data the mbe_budget_mb thread has taken "
       "out of host memory since realize" },

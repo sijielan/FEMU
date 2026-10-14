@@ -856,10 +856,19 @@
 #     posted completion entry.  It shows how far the real completion
 #     lands after the modelled one.  It is not part of total.
 #
+# @copy-read: the copy of a read's data from the memory backend to the
+#     host, inside submit.  A copy served from host memory takes a
+#     microsecond or so; one that waits for zswap or for the host disk
+#     takes longer, so its buckets show which tier served the reads.
+#
+# @copy-write: the same for a write's data, from the host to the
+#     backend.
+#
 # Since: 10.1
 ##
 { 'enum': 'FemuIoStage',
-  'data': [ 'submit', 'ftl', 'hold', 'post-delay', 'total', 'past-due' ] }
+  'data': [ 'submit', 'ftl', 'hold', 'post-delay', 'total', 'past-due',
+            'copy-read', 'copy-write' ] }
 
 ##
 # @FemuIoStageInfo:

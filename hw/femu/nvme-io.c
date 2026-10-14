@@ -56,6 +56,11 @@ static void nvme_stages_note(FemuCtrl *n, int index_poller, NvmeRequest *req,
                         set->returned_after_due + 1);
         }
     }
+    if (req->t_copy >= 0) {
+        nvme_stage_add(&set->st[req->is_write ? FEMU_STAGE_COPY_WRITE
+                                               : FEMU_STAGE_COPY_READ],
+                       req->t_copy);
+    }
     nvme_stage_add(&set->st[FEMU_STAGE_POST_DELAY], post - ready);
     nvme_stage_add(&set->st[FEMU_STAGE_PAST_DUE], post - req->expire_time);
     nvme_stage_add(&set->st[FEMU_STAGE_TOTAL], post - req->stime);
@@ -340,6 +345,7 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
         /* Coperd: record req->stime at earliest convenience */
         req->expire_time = req->stime = nvme_io_clock(n);
         req->t_handoff = 0;
+        req->t_copy = -1;
         req->t_return = 0;
         req->cqe.cid = cmd.cid;
         req->cmd_opcode = cmd.opcode;
@@ -1228,6 +1234,8 @@ uint16_t nvme_rw(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
                 req->fdp_dtype = (le16_to_cpu(rw->control) >> 4) & 0xF;
             }
 
+            int64_t t0 = n->stage_sets ? nvme_io_clock(n) : 0;
+
             backend_lock_range(n->mbe, moff, data_size);
             if (femu_dma_rw(n, prp1, mb + moff, len0, !req->is_write) ||
                 (rem && femu_dma_rw(n, prp2, mb + moff + len0, rem,
@@ -1236,6 +1244,9 @@ uint16_t nvme_rw(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
                 return NVME_DATA_TRAS_ERROR | NVME_DNR;
             }
             backend_unlock_range(n->mbe, moff, data_size);
+            if (n->stage_sets) {
+                req->t_copy = nvme_io_clock(n) - t0;
+            }
             if (req->is_write) {
                 nvme_mark_written(ns, slba, nlb);
             }
@@ -1287,7 +1298,13 @@ mapped:
     if (meta_size) {
         qemu_mutex_lock(&ns->mdata_lock);
     }
+    if (n->stage_sets) {
+        req->t_copy = nvme_io_clock(n);
+    }
     ret = backend_rw(n->mbe, &req->qsg, &data_offset, req->is_write);
+    if (n->stage_sets) {
+        req->t_copy = nvme_io_clock(n) - req->t_copy;
+    }
     if (!ret && meta_size &&
         femu_dma_write(n, mptr, ns->mdata + slba * ms, meta_size)) {
         ret = -EIO;

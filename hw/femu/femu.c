@@ -4010,6 +4010,24 @@ static void femu_mbe_resident_get(Object *obj, Visitor *v, const char *name,
     visit_type_uint64(v, name, &value, errp);
 }
 
+static void femu_mbe_swapped_get(Object *obj, Visitor *v, const char *name,
+                                 void *opaque, Error **errp)
+{
+    uint64_t value = backend_swapped_bytes(FEMU(obj)->mbe);
+
+    visit_type_uint64(v, name, &value, errp);
+}
+
+/* @opaque 0: the cgroup's zswap pool, 1: what it holds uncompressed */
+static void femu_mbe_zswap_get(Object *obj, Visitor *v, const char *name,
+                               void *opaque, Error **errp)
+{
+    uint64_t value[2];
+
+    backend_cgroup_zswap(&value[0], &value[1]);
+    visit_type_uint64(v, name, &value[(uintptr_t)opaque], errp);
+}
+
 static void femu_mbe_evicted_get(Object *obj, Visitor *v, const char *name,
                                  void *opaque, Error **errp)
 {
@@ -4056,6 +4074,12 @@ static void femu_instance_init(Object *obj)
                         NULL, NULL, NULL);
     object_property_add(obj, "mbe-evicted", "uint64", femu_mbe_evicted_get,
                         NULL, NULL, NULL);
+    object_property_add(obj, "mbe-swapped", "uint64", femu_mbe_swapped_get,
+                        NULL, NULL, NULL);
+    object_property_add(obj, "mbe-zswap-pool", "uint64", femu_mbe_zswap_get,
+                        NULL, NULL, (void *)0);
+    object_property_add(obj, "mbe-zswapped", "uint64", femu_mbe_zswap_get,
+                        NULL, NULL, (void *)1);
     object_property_add(obj, "tag-checked", "uint64", femu_tag_stat_get,
                         NULL, NULL, (void *)0);
     object_property_add(obj, "tag-errors", "uint64", femu_tag_stat_get,

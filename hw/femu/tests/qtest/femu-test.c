@@ -31568,6 +31568,120 @@ static void femu_test_precond_equivalent(void *obj, void *data,
     g_assert_cmpuint(precond, ==, guest);
 }
 
+/* the median bucket of a copy stage, as 2^i ns, for the log */
+static int femu_stage_median(QDict *st)
+{
+    uint64_t half = (qdict_get_int(st, "count") + 1) / 2, seen = 0;
+
+    for (int b = 0; b < 40; b++) {
+        seen += femu_stage_bucket(st, b);
+        if (seen >= half) {
+            return b;
+        }
+    }
+    return 39;
+}
+
+/*
+ * Data a sparse backend's budget pushed out to swap shows in mbe-swapped,
+ * and io_stages times each command's backend copy: every read and write
+ * counts once in copy-read or copy-write. The copies that fault data back
+ * from swap take longer, which the log shows; the test does not depend on
+ * how much longer, which is the host's business.
+ *
+ * As an experiment under a memory cgroup (lessdram-host.sh run), the
+ * environment can scale it: FEMU_MBE_TIERS_PAGES pages of 4 KiB (2048) and
+ * FEMU_MBE_TIERS_BUDGET_MB (2; 0 leaves eviction to the cgroup).
+ */
+static void femu_test_mbe_tiers(void *obj, void *data, QGuestAllocator *unused)
+{
+    const char *env_pages = g_getenv("FEMU_MBE_TIERS_PAGES");
+    const char *env_budget = g_getenv("FEMU_MBE_TIERS_BUDGET_MB");
+    const uint32_t pages = env_pages ? atoi(env_pages) : 2048;
+    const uint32_t budget = env_budget ? atoi(env_budget) : 2;
+    QOSState *qs;
+    QTestState *qts;
+    QPCIDevice *pdev;
+    FemuCtrlState c = { 0 };
+    uint64_t buf, stride, swapped = 0;
+    QDict *rsp, *ret;
+    int waited;
+
+    if (!femu_host_has_swap()) {
+        g_test_skip("a sparse backend evicts to swap, and the host has none");
+        return;
+    }
+    g_assert_cmpuint(pages, >=, 2);
+    qs = qtest_pc_boot("-machine pc -nodefaults -device femu,id=mbe,addr=5,"
+                       "devsz_mb=%u,femu_mode=2,mbe_type=sparse,"
+                       "mbe_budget_mb=%u,mbe_pin_meta=off,io_stages=on",
+                       MAX(64, pages / 256 * 2), budget);
+    qts = qs->qts;
+    pdev = qpci_device_find(qs->pcibus, QPCI_DEVFN(5, 0));
+    buf = guest_alloc(&qs->alloc, 4096);
+    femu_enable(&c, pdev, &qs->alloc);
+    femu_create_io_queues(&c);
+    stride = FEMU_DATA_SIZE / c.lba_size;
+    for (uint32_t i = 0; i < pages; i++) {
+        qtest_memset(qts, buf, i * 3 + 1, FEMU_DATA_SIZE);
+        g_assert_cmphex(femu_rw(&c, NVME_CMD_WRITE, i * stride, buf), ==,
+                        NVME_SUCCESS);
+    }
+    for (waited = 0; waited < 10000; waited += 50) {
+        swapped = femu_mbe_get(qts, "mbe-swapped");
+        if (swapped >= (uint64_t)pages * FEMU_DATA_SIZE / 2) {
+            break;
+        }
+        g_usleep(50 * 1000);
+    }
+    /* left to a cgroup, how much goes depends on the limit */
+    if (budget) {
+        g_assert_cmpuint(swapped, >=, (uint64_t)pages * FEMU_DATA_SIZE / 2);
+    }
+    /* half the pages, scattered, so swap readahead brings in few of them */
+    for (uint32_t k = 0; k < pages / 2; k++) {
+        uint32_t i = (uint64_t)k * 1031 % pages;
+        uint8_t got[FEMU_DATA_SIZE];
+
+        g_assert_cmphex(femu_rw(&c, NVME_CMD_READ, i * stride, buf), ==,
+                        NVME_SUCCESS);
+        qtest_memread(qts, buf, got, sizeof(got));
+        g_assert_cmpint(got[0], ==, (uint8_t)(i * 3 + 1));
+        g_assert_cmpint(got[sizeof(got) - 1], ==, (uint8_t)(i * 3 + 1));
+    }
+
+    rsp = qtest_qmp(qts, "{'execute':'query-femu-stages',"
+                    "'arguments':{'path':'/machine/peripheral/mbe'}}");
+    ret = qdict_get_qdict(rsp, "return");
+    g_assert_cmpint(qdict_get_int(femu_stage(ret, "copy-write"), "count"), ==,
+                    pages);
+    g_assert_cmpint(qdict_get_int(femu_stage(ret, "copy-read"), "count"), ==,
+                    pages / 2);
+    {
+        QDict *rd = femu_stage(ret, "copy-read");
+        uint64_t slow = 0;
+
+        for (int b = 13; b < 40; b++) {
+            slow += femu_stage_bucket(rd, b);
+        }
+        g_test_message("swapped %" PRIu64 " KiB; copy median 2^%d ns for "
+                       "writes, 2^%d ns for reads, %" PRIu64 " of %u reads "
+                       "8 us or more, max %" PRId64 " ns; zswap pool %"
+                       PRIu64 " of %" PRIu64 " bytes", swapped >> 10,
+                       femu_stage_median(femu_stage(ret, "copy-write")),
+                       femu_stage_median(rd), slow, pages / 2,
+                       qdict_get_int(rd, "max-ns"),
+                       femu_mbe_get(qts, "mbe-zswap-pool"),
+                       femu_mbe_get(qts, "mbe-zswapped"));
+    }
+    qobject_unref(rsp);
+
+    femu_disable(&c);
+    guest_free(&qs->alloc, buf);
+    g_free(pdev);
+    qtest_pc_shutdown(qs);
+}
+
 /* mbe_* settings a backend type does not read fail realize */
 static void femu_test_mbe_refused(void *obj, void *data,
                                   QGuestAllocator *alloc)
@@ -32695,6 +32809,7 @@ static void femu_register_nodes(void)
     qos_add_test("mbe-budget-file", "femu", femu_test_mbe_budget,
                  &(QOSGraphTestOptions) { .arg = (void *)"file" });
     qos_add_test("mbe-budget-sparse", "femu", femu_test_mbe_budget, NULL);
+    qos_add_test("mbe-tiers", "femu", femu_test_mbe_tiers, NULL);
     qos_add_test("pel-file-quit-media", "femu", femu_test_pel_file_quit,
                  &(QOSGraphTestOptions) { .arg = GINT_TO_POINTER(1) });
     qos_add_test("pel-file-invalid", "femu", femu_test_pel_file_invalid, NULL);

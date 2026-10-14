@@ -22,7 +22,7 @@ Devices:
 
 ## `femu`: NVMe controller
 
-`-device femu` has 198 properties of its own and 6 QOM properties listed in [runtime-properties.md](runtime-properties.md).
+`-device femu` has 198 properties of its own and 9 QOM properties listed in [runtime-properties.md](runtime-properties.md).
 
 ### Mode, capacity and namespaces
 

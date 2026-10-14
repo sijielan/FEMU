@@ -618,6 +618,74 @@ uint64_t backend_resident_bytes(SsdDramBackend *b)
     return backend_count_pages(b, start, end - start, buf, cap) * pgsz;
 }
 
+/*
+ * Bytes of a sparse backend's data the host has swapped out, to zswap or to
+ * a swap device: pages /proc/self/pagemap reports swapped (bit 62). Other
+ * types have no anonymous data to swap.
+ */
+uint64_t backend_swapped_bytes(SsdDramBackend *b)
+{
+    const uint64_t cap = 64 * KiB;
+    uint64_t pgsz = qemu_real_host_page_size();
+    g_autofree uint64_t *pm = NULL;
+    uintptr_t addr, end;
+    uint64_t swapped = 0;
+
+    if (!b || b->pagemap_fd < 0 || !b->logical_space) {
+        return 0;
+    }
+    addr = (uintptr_t)b->logical_space;
+    end = addr + ROUND_UP(b->size, pgsz);
+    pm = g_new(uint64_t, cap);
+    while (addr < end) {
+        uint64_t n = MIN((end - addr) / pgsz, cap);
+
+        if (pread(b->pagemap_fd, pm, n * sizeof(*pm),
+                  addr / pgsz * sizeof(*pm)) != n * sizeof(*pm)) {
+            break;
+        }
+        for (uint64_t i = 0; i < n; i++) {
+            swapped += (pm[i] >> 62) & 1;
+        }
+        addr += n * pgsz;
+    }
+    return swapped * pgsz;
+}
+
+/*
+ * The zswap pool of this process's memory cgroup: @pool bytes holding
+ * @stored bytes of compressed pages, from memory.stat. With mbe_pin_meta
+ * everything but the backend data is locked, so that is what zswap holds.
+ * Both 0 when the cgroup or the fields are not there.
+ */
+void backend_cgroup_zswap(uint64_t *pool, uint64_t *stored)
+{
+    g_autofree char *cg = NULL;
+    g_autofree char *path = NULL;
+    g_autofree char *stat = NULL;
+    const char *p;
+
+    *pool = *stored = 0;
+    if (!g_file_get_contents("/proc/self/cgroup", &cg, NULL, NULL) ||
+        !(p = strstr(cg, "0::"))) {
+        return;
+    }
+    path = g_strdup_printf("/sys/fs/cgroup%.*s/memory.stat",
+                           (int)strcspn(p + 3, "\n"), p + 3);
+    if (!g_file_get_contents(path, &stat, NULL, NULL)) {
+        return;
+    }
+    for (p = stat; p && *p; p = strchr(p, '\n') ? strchr(p, '\n') + 1 : NULL) {
+        const char *end;
+
+        if (strstart(p, "zswap ", NULL)) {
+            qemu_strtou64(p + 6, &end, 10, pool);
+        } else if (strstart(p, "zswapped ", NULL)) {
+            qemu_strtou64(p + 9, &end, 10, stored);
+        }
+    }
+}
+
 /* A backend another device lends takes its locks from the borrower. */
 void backend_init_range_locks(SsdDramBackend *b)
 {

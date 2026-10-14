@@ -200,7 +200,8 @@ DEVICES = [
                 "title": "Memory backend usage",
                 "kind": "runtime",
                 "props": [
-                    "mbe-resident", "mbe-evicted",
+                    "mbe-resident", "mbe-evicted", "mbe-swapped",
+                    "mbe-zswap-pool", "mbe-zswapped",
                 ],
             },
             {

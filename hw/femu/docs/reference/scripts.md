@@ -195,6 +195,18 @@ Run this one on the host:
 | `pin.sh [FIRST_CPU]` | Pins each vCPU thread, then each `femu-poller`, `FEMU-FTL-Thread`, `femu-cxl-ftl` and `femu-cxl-cca`, to its own host CPU, starting at `FIRST_CPU` (default 0), and moves the other QEMU threads, `femu-csd-cu` included, to the CPUs after those. It finds the threads by name, so QEMU must run with `-name NAME,debug-threads=on` (the launchers pass it), and it finds QEMU with `pgrep -x qemu-system-x86`; set `QEMU_PID` when several run. Run it after the guest has booted: the pollers start when the guest enables the controller. It stops if the host has too few CPUs. See [performance tuning](../guides/performance-tuning.md#pin-the-threads). |
 | `set_cpu_perf_mode.sh` | Sets every CPU's cpufreq scaling policy to `performance` through sysfs. Run it as root. |
 
+## Running with less host DRAM
+
+For a memory backend that does not hold the whole device in DRAM
+(`mbe_type=sparse|file|none`; see [properties.md](properties.md)).
+
+| Script | What it does |
+| --- | --- |
+| `lessdram-host.sh check` | Reports zswap parameters, swap devices, THP, `RLIMIT_MEMLOCK` (which `mbe_pin_meta=on` needs unlimited) and the cgroup v2 memory files. |
+| `lessdram-host.sh zswap-on [COMPRESSOR [ZPOOL [PERCENT]]]` | As root: turns zswap on, by default with `lz4`, `zsmalloc` and a 20% pool. Not persistent. |
+| `lessdram-host.sh run [--mem-max SIZE] [--swap-max SIZE] [--zswap-max SIZE] [--user] -- CMD...` | Runs CMD (QEMU) in a transient systemd scope with `memory.max`, `memory.swap.max` and `memory.zswap.max`, so the host keeps hot backend data in DRAM and moves the rest to zswap and swap. `--user` needs no root but cannot lift `RLIMIT_MEMLOCK`: use `mbe_pin_meta=off` there. Also works as `QTEST_QEMU_BINARY="lessdram-host.sh run --user --mem-max 80M -- ./qemu-system-x86_64"`. |
+| `lessdram-compress-ratio.py IMAGE [--sample N]` | Reads a disk image in 4 KiB pages and reports the share of zero and same-filled pages and the compression ratio of the rest (lz4 when the Python module is installed, else zlib level 1), to judge whether a zswap tier would hold much more than DRAM. |
+
 ## Documentation tooling
 
 These run in CI. [docs-maintenance.md](../development/docs-maintenance.md)

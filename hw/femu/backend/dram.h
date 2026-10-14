@@ -79,6 +79,8 @@ void free_dram_backend(SsdDramBackend *);
 void backend_zero_range(SsdDramBackend *b, uint64_t off, uint64_t len);
 uint64_t backend_resident_bytes(SsdDramBackend *b);
 void backend_prefetch(SsdDramBackend *b, uint64_t off, uint64_t len);
+uint64_t backend_swapped_bytes(SsdDramBackend *b);
+void backend_cgroup_zswap(uint64_t *pool, uint64_t *stored);
 
 int backend_rw(SsdDramBackend *, QEMUSGList *, uint64_t *, bool);
 void backend_init_range_locks(SsdDramBackend *b);
