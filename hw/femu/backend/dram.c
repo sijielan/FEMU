@@ -63,9 +63,11 @@ int femu_mbe_parse_type(const char *name, FemuMbeType *type, Error **errp)
         *type = FEMU_MBE_SPARSE;
     } else if (!strcmp(name, "file")) {
         *type = FEMU_MBE_FILE;
+    } else if (!strcmp(name, "none")) {
+        *type = FEMU_MBE_NONE;
     } else {
-        error_setg(errp, "femu: mbe_type=%s is not one of dram, sparse, file",
-                   name);
+        error_setg(errp, "femu: mbe_type=%s is not one of dram, sparse, file, "
+                   "none", name);
         return -1;
     }
     return 0;
@@ -458,6 +460,17 @@ int init_dram_backend(SsdDramBackend **mbe, int64_t nbytes,
     if (cfg->pin_meta && mbe_pin_process(errp)) {
         return -1;
     }
+    if (cfg->type == FEMU_MBE_NONE) {
+        b = *mbe = g_malloc0(sizeof(SsdDramBackend));
+        b->size = nbytes;
+        b->type = FEMU_MBE_NONE;
+        b->fd = -1;
+        b->pagemap_fd = -1;
+        femu_log("backend: %" PRId64 " MiB, no data kept (mbe_type=none)\n",
+                 nbytes / MiB);
+        backend_init_range_locks(b);
+        return 0;
+    }
     if (cfg->lock && mbe_check_memlock("mbe_lock", errp)) {
         return -1;
     }
@@ -534,7 +547,7 @@ void backend_zero_range(SsdDramBackend *b, uint64_t off, uint64_t len)
     uint64_t start = ROUND_UP(off, pgsz);
     uint64_t end = QEMU_ALIGN_DOWN(off + len, pgsz);
 
-    if (!len) {
+    if (!len || b->type == FEMU_MBE_NONE) {
         return;
     }
     if (b->type == FEMU_MBE_FILE &&
@@ -574,7 +587,8 @@ void backend_prefetch(SsdDramBackend *b, uint64_t off, uint64_t len)
     uint64_t pgsz = qemu_real_host_page_size();
     uint64_t start, end;
 
-    if (!len || off > (uint64_t)b->size || len > (uint64_t)b->size - off) {
+    if (!b->logical_space || !len || off > (uint64_t)b->size ||
+        len > (uint64_t)b->size - off) {
         return;
     }
     start = QEMU_ALIGN_DOWN(off, pgsz);
@@ -776,6 +790,49 @@ static MemTxResult backend_copy(FemuCtrl *n, dma_addr_t addr, void *ptr,
 }
 
 /*
+ * A backend with no data: a read gets zeros, a write is dropped. The offsets
+ * are checked as backend_rw() checks them, so a mode's bad translation fails
+ * the same way whatever the backend.
+ */
+static int backend_rw_nodata(SsdDramBackend *b, QEMUSGList *qsg,
+                             uint64_t *lbal, bool is_write)
+{
+    static const uint8_t zeros[64 * KiB];
+    FemuCtrl *n = container_of(qsg->dev, FemuCtrl, parent_obj.qdev);
+    bool per_entry = b->femu_mode == FEMU_OCSSD_MODE;
+    uint64_t mb_oft = lbal[0];
+    int ret = 0;
+
+    for (int i = 0; i < qsg->nsg && !ret; i++) {
+        dma_addr_t addr = qsg->sg[i].base;
+        dma_addr_t len = qsg->sg[i].len;
+
+        if (per_entry) {
+            mb_oft = lbal[i];
+        }
+        if (mb_oft > (uint64_t)b->size || len > (uint64_t)b->size - mb_oft) {
+            femu_err("backend: %" PRIu64 "+%" PRIu64 " is outside the %" PRId64
+                     " byte backing store\n", mb_oft, (uint64_t)len, b->size);
+            ret = -ERANGE;
+            break;
+        }
+        while (!is_write && len) {
+            dma_addr_t step = MIN(len, sizeof(zeros));
+
+            if (femu_dma_rw(n, addr, (void *)zeros, step, true)) {
+                ret = -EIO;
+                break;
+            }
+            addr += step;
+            len -= step;
+        }
+        mb_oft += qsg->sg[i].len;
+    }
+    qemu_sglist_destroy(qsg);
+    return ret;
+}
+
+/*
  * Copy between guest memory and the backing store. The scatter list is
  * consumed whatever the outcome. Returns 0, -ERANGE when a mode's address
  * translation leaves the backing store, or -EIO when guest memory could not
@@ -796,6 +853,9 @@ int backend_rw(SsdDramBackend *b, QEMUSGList *qsg, uint64_t *lbal, bool is_write
     uint64_t lock_len = qsg->size;
     int ret = 0;
 
+    if (b->type == FEMU_MBE_NONE) {
+        return backend_rw_nodata(b, qsg, lbal, is_write);
+    }
     if (is_write) {
         dir = DMA_DIRECTION_TO_DEVICE;
     }

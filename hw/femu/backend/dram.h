@@ -25,13 +25,16 @@
  * allocation pinned up front, as FEMU always had. SPARSE maps anonymous memory
  * that takes host pages only for blocks written and gives them back when the
  * blocks are deallocated. FILE maps a host file, so the host page cache holds
- * the data and the kernel writes it back. DRAM is 0 so that a backend another
+ * the data and the kernel writes it back. NONE keeps no data at all: reads
+ * return zeros, for experiments that need only the timing and the FTL's
+ * behavior. DRAM is 0 so that a backend another
  * device lends, zero-initialized, keeps the old behavior.
  */
 typedef enum FemuMbeType {
     FEMU_MBE_DRAM = 0,
     FEMU_MBE_SPARSE,
     FEMU_MBE_FILE,
+    FEMU_MBE_NONE,
 } FemuMbeType;
 
 /* the mbe_* properties, as init_dram_backend() takes them */

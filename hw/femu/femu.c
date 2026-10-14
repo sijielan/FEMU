@@ -2624,6 +2624,51 @@ static bool femu_check_pd_props(FemuCtrl *n, Error **errp)
  * namespace modes are checked in nvme_init_namespaces().
  */
 /*
+ * mbe_type=none keeps no data, so only modes that keep everything else apart
+ * from it can run on it: KV keys and CSD programs live in the data, an
+ * Open-Channel host keeps its FTL there, and metadata, protection
+ * information and the power loss write buffer are read back from it. Compare
+ * and Copy would compare or move zeros, so they are not offered.
+ */
+static bool femu_check_nodata(FemuCtrl *n, Error **errp)
+{
+    if (!BBSSD(n) && !NOSSD(n) && !ZNSSD(n)) {
+        error_setg(errp, "femu: mbe_type=none supports bbssd, NoSSD and ZNS "
+                   "only");
+        return false;
+    }
+    if (n->namespace_modes) {
+        g_auto(GStrv) modes = g_strsplit(n->namespace_modes, ",", -1);
+
+        for (int i = 0; modes[i]; i++) {
+            if (strcmp(modes[i], "bbssd") && strcmp(modes[i], "nossd") &&
+                strcmp(modes[i], "znssd")) {
+                error_setg(errp, "femu: mbe_type=none supports bbssd, nossd "
+                           "and znssd namespaces only, not %s", modes[i]);
+                return false;
+            }
+        }
+    }
+    if (n->meta || n->pi || n->extended || n->power_loss) {
+        error_setg(errp, "femu: mbe_type=none keeps no data to hold "
+                   "metadata, protection information or a power loss "
+                   "buffer; leave meta, pi, extended and power_loss unset");
+        return false;
+    }
+    if (n->mbe_budget_mb || !n->mbe_prefetch) {
+        error_setg(errp, "femu: mbe_budget_mb and mbe_prefetch need "
+                   "mbe_type=sparse or file");
+        return false;
+    }
+    if (n->oncs & (NVME_ONCS_COMPARE | NVME_ONCS_COPY)) {
+        femu_log("mbe_type=none: Compare and Copy are not offered\n");
+        n->oncs &= ~(NVME_ONCS_COMPARE | NVME_ONCS_COPY);
+    }
+    n->mbe_cfg.prefetch = false;
+    return true;
+}
+
+/*
  * The mbe_* properties. Only a sparse or file backend reads them, so setting
  * one for another type fails rather than doing nothing; dram with none set
  * is the backend FEMU always had.
@@ -2656,6 +2701,9 @@ static bool femu_check_mbe_props(FemuCtrl *n, Error **errp)
                    "leaves mbe_budget_mb nothing to evict");
         return false;
     }
+    if (cfg->type == FEMU_MBE_NONE && !femu_check_nodata(n, errp)) {
+        return false;
+    }
     if (n->cxl_dev) {
         error_setg(errp, "femu: mbe_type=%s cannot be used with cxl_ssd, "
                    "which serves the CXL device's own memory", n->mbe_type);
@@ -2666,7 +2714,7 @@ static bool femu_check_mbe_props(FemuCtrl *n, Error **errp)
                    n->mbe_file ? "not used" : "required", n->mbe_type);
         return false;
     }
-    if (cfg->type == FEMU_MBE_FILE && (n->mbe_thp || n->mbe_lock)) {
+    if (cfg->type != FEMU_MBE_SPARSE && (n->mbe_thp || n->mbe_lock)) {
         error_setg(errp, "femu: mbe_thp and mbe_lock need mbe_type=sparse");
         return false;
     }
@@ -3613,6 +3661,12 @@ static void femu_test_namespace(Object *obj, const char *value, Error **errp)
             }
         }
         nvme_ns_release(n, &ns);
+        return;
+    }
+    if (!n->mbe->logical_space &&
+        (!strcmp(value, "seed-sanitize") || !strcmp(value, "check-sanitize") ||
+         !strcmp(value, "check-erased"))) {
+        error_setg(errp, "the backend keeps no data to seed or check");
         return;
     }
     if (!n->sq[0] && !strcmp(value, "seed-sanitize")) {

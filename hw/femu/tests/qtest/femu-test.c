@@ -31165,6 +31165,59 @@ static void femu_test_mbe_budget(void *obj, void *data,
     rmdir(dir);
 }
 
+/*
+ * mbe_type=none keeps no data: a block written reads back as zeros, no host
+ * memory is taken for it, and Compare and Copy, which need the data, are
+ * not offered. @data is the device's mode options.
+ */
+static void femu_test_mbe_none(void *obj, void *data, QGuestAllocator *unused)
+{
+    const uint32_t pages = 64;
+    QOSState *qs = qtest_pc_boot(
+        "-machine pc -nodefaults -device femu,id=mbe,addr=5,%s,"
+        "mbe_type=none,mbe_pin_meta=off", (const char *)data);
+    QTestState *qts = qs->qts;
+    QPCIDevice *pdev = qpci_device_find(qs->pcibus, QPCI_DEVFN(5, 0));
+    FemuCtrlState c = { 0 };
+    uint64_t buf = guest_alloc(&qs->alloc, 4096);
+    uint8_t got[FEMU_DATA_SIZE];
+    NvmeIdCtrl id;
+    uint64_t stride;
+    uint32_t i, j;
+
+    femu_enable(&c, pdev, &qs->alloc);
+    femu_create_io_queues(&c);
+    stride = FEMU_DATA_SIZE / c.lba_size;
+    g_assert_cmphex(femu_identify(&c, 0, NVME_ID_CNS_CTRL, 0, buf), ==,
+                    NVME_SUCCESS);
+    qtest_memread(qts, buf, &id, sizeof(id));
+    g_assert_cmphex(le16_to_cpu(id.oncs) &
+                    (NVME_ONCS_COMPARE | NVME_ONCS_COPY), ==, 0);
+    g_assert_cmphex(le16_to_cpu(id.oncs) & NVME_ONCS_DSM, !=, 0);
+
+    for (i = 0; i < pages; i++) {
+        qtest_memset(qts, buf, 0x5a, FEMU_DATA_SIZE);
+        g_assert_cmphex(femu_rw(&c, NVME_CMD_WRITE, i * stride, buf), ==,
+                        NVME_SUCCESS);
+    }
+    for (i = 0; i < pages; i += 7) {
+        qtest_memset(qts, buf, 0xa5, FEMU_DATA_SIZE);
+        g_assert_cmphex(femu_rw(&c, NVME_CMD_READ, i * stride, buf), ==,
+                        NVME_SUCCESS);
+        qtest_memread(qts, buf, got, sizeof(got));
+        for (j = 0; j < sizeof(got); j++) {
+            g_assert_cmpint(got[j], ==, 0);
+        }
+    }
+    g_assert_cmphex(femu_dealloc_pages(&c, 0, pages, buf), ==, NVME_SUCCESS);
+    g_assert_cmpuint(femu_mbe_resident(qts), ==, 0);
+
+    femu_disable(&c);
+    guest_free(&qs->alloc, buf);
+    g_free(pdev);
+    qtest_pc_shutdown(qs);
+}
+
 /* mbe_* settings a backend type does not read fail realize */
 static void femu_test_mbe_refused(void *obj, void *data,
                                   QGuestAllocator *alloc)
@@ -31187,13 +31240,26 @@ static void femu_test_mbe_refused(void *obj, void *data,
           "'mbe_file':'/nonexistent/x'", "need mbe_type=sparse" },
         { "'mbe_type':'file','mbe_pin_meta':false,"
           "'mbe_file':'/nonexistent/x'", "/nonexistent/x" },
+        { "'mbe_type':'none','mbe_pin_meta':false,'femu_mode':5",
+          "supports bbssd, NoSSD and ZNS only" },
+        { "'mbe_type':'none','mbe_pin_meta':false,'femu_mode':0",
+          "supports bbssd, NoSSD and ZNS only" },
+        { "'mbe_type':'none','mbe_pin_meta':false,'meta':8,'mc':3",
+          "leave meta, pi, extended and power_loss unset" },
+        { "'mbe_type':'none','mbe_pin_meta':false,'pi':true",
+          "leave meta, pi, extended and power_loss unset" },
+        { "'mbe_type':'none','mbe_pin_meta':false,'mbe_budget_mb':4",
+          "mbe_budget_mb and mbe_prefetch need" },
+        { "'mbe_type':'none','mbe_pin_meta':false,'mbe_thp':true",
+          "mbe_thp and mbe_lock need mbe_type=sparse" },
     };
     QDict *rsp;
 
     for (int i = 0; i < ARRAY_SIZE(opts); i++) {
         g_autofree char *cmd = g_strdup_printf(
             "{'execute':'device_add','arguments':{'driver':'femu',"
-            "'id':'mbe-bad','addr':'5','devsz_mb':8,'femu_mode':2,%s}}",
+            "'id':'mbe-bad','addr':'5','devsz_mb':8,%s%s}}",
+            strstr(opts[i][0], "femu_mode") ? "" : "'femu_mode':2,",
             opts[i][0]);
 
         rsp = qtest_qmp(qts, "%p", qobject_from_json(cmd, NULL));
@@ -32210,6 +32276,13 @@ static void femu_register_nodes(void)
     qos_add_test("mbe-file", "femu", femu_test_mbe_lazy,
                  &(QOSGraphTestOptions) { .arg = (void *)"file" });
     qos_add_test("mbe-refused", "femu", femu_test_mbe_refused, NULL);
+    qos_add_test("mbe-none-nossd", "femu", femu_test_mbe_none,
+                 &(QOSGraphTestOptions) {
+        .arg = (void *)"devsz_mb=64,femu_mode=2" });
+    qos_add_test("mbe-none-bbssd", "femu", femu_test_mbe_none,
+                 &(QOSGraphTestOptions) {
+        .arg = (void *)"devsz_mb=4,femu_mode=1,secs_per_pg=8,pgs_per_blk=4,"
+                       "blks_per_pl=128,pls_per_lun=1,luns_per_ch=2,nchs=2" });
     qos_add_test("mbe-budget-file", "femu", femu_test_mbe_budget,
                  &(QOSGraphTestOptions) { .arg = (void *)"file" });
     qos_add_test("mbe-budget-sparse", "femu", femu_test_mbe_budget, NULL);

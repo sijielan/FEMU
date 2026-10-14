@@ -1198,7 +1198,8 @@ uint16_t nvme_rw(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
      * NoSSD does not inject uncorrectable read errors, so skipping that check
      * (done on the generic read path) is correct here.
      */
-    if (NOSSD(n) && n->hiops_inline && !n->cmbsz && prp1) {
+    if (NOSSD(n) && n->hiops_inline && !n->cmbsz && prp1 &&
+        n->mbe->logical_space) {
         uint64_t pg = n->page_size;
         uint64_t off0 = prp1 & (pg - 1);
         uint64_t len0 = MIN(data_size, pg - off0);

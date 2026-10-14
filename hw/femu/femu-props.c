@@ -73,7 +73,8 @@ static const FemuPropDesc femu_ctrl_descs[] = {
       "How the memory backend holds data: dram (default) allocates and pins "
       "all of it at start; sparse takes host memory only for blocks written "
       "and returns it on deallocate; file maps mbe_file so the host page "
-      "cache holds the data" },
+      "cache holds the data; none keeps no data, reads return zeros "
+      "(bbssd, NoSSD and ZNS without metadata, PI or power_loss)" },
     { "mbe_file",
       "Host file a mbe_type=file backend maps, created or extended with a "
       "hole to the backend size; its file system must have room for the "
