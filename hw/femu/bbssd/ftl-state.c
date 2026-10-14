@@ -12,7 +12,8 @@
  * saved run had: the same commands then make the same decisions. Caches that
  * only model time, the read cache and the DFTL mapping cache, start empty.
  *
- * Supported is the flat page or dftl mapping without FDP, streams, hot/cold
+ * Under FDP the reclaim units, groups and handles follow (state_fdp_*).
+ * Supported is the flat page or dftl mapping without streams, hot/cold
  * separation, paced collection or wear-out; realize refuses the rest. The
  * file is native-endian and records the geometry it was saved with, which
  * loading checks.
@@ -23,7 +24,7 @@
 #include "../inc/pqueue.h"
 
 #define STATE_MAGIC     "FEMUFTL1"
-#define STATE_VERSION   2       /* 2: page status in one byte */
+#define STATE_VERSION   3       /* 2: page status in a byte; 3: FDP */
 
 enum {
     LINE_NONE, LINE_FREE, LINE_VICTIM, LINE_FULL, LINE_WP, LINE_LOG_WP,
@@ -40,6 +41,7 @@ typedef struct StateHeader {
     uint64_t nsze;
     uint32_t lbads;
     uint32_t has_tag;
+    uint32_t has_fdp;
     char mapping[16];
 } StateHeader;
 
@@ -76,10 +78,10 @@ bool ftl_state_supported(FemuCtrl *n, Error **errp)
 
     if ((map && strcmp(map, "page") && strcmp(map, "dftl")) || n->streams ||
         n->bb_params.hot_cold_sep || n->bb_params.gc_pace ||
-        n->blk_pe_limit || (n->subsys && n->subsys->params.fdp.enabled)) {
+        n->blk_pe_limit) {
         error_setg(errp, "femu: precond_save and precond_load support the "
-                   "page and dftl mappings without FDP, streams, "
-                   "hot_cold_sep, gc_pace or blk_pe_limit");
+                   "page and dftl mappings without streams, hot_cold_sep, "
+                   "gc_pace or blk_pe_limit");
         return false;
     }
     return true;
@@ -105,6 +107,7 @@ static void state_header(struct ssd *ssd, NvmeNamespace *ns, StateHeader *h)
     h->nsze = le64_to_cpu(ns->id_ns.nsze);
     h->lbads = ns->lbaf.lbads;
     h->has_tag = ssd->tag != NULL;
+    h->has_fdp = ssd->fdp_enabled;
     pstrcpy(h->mapping, sizeof(h->mapping), ssd->mapping->name);
 }
 
@@ -149,6 +152,316 @@ static bool state_write(FILE *f, const void *p, size_t len)
 static bool state_read(FILE *f, void *p, size_t len)
 {
     return fread(p, 1, len, f) == len;
+}
+
+static bool state_get_wp(struct ssd *ssd, struct write_pointer *wp,
+                         const StateWp *s);
+
+/*
+ * FDP: a reclaim unit is named by group and index, rg * tt_nru + index, -1
+ * for none. Which lines each unit owns is set at init, in a fixed order,
+ * and never changes, so the units only need their state.
+ */
+typedef struct StateFdpHeader {
+    uint32_t nrg, nruhs, tt_nru, lines_per_ru;
+    int32_t mgmt_type;
+    uint32_t pad;
+    uint64_t written_bits;
+} StateFdpHeader;
+
+typedef struct StateRu {
+    int32_t ruh;            /* owning handle, -1 for none */
+    int32_t vpc, ipc;
+    int32_t line0;          /* the unit's first line, checked on load */
+    float utilization, my_cb;
+    uint64_t last_invalidated_time;
+    uint64_t ruamw;
+    StateWp wp;
+    int32_t pad;
+} StateRu;
+
+typedef struct StateRuh {
+    int32_t present;        /* the namespace places into this handle */
+    int32_t ru_in_use_cnt, ruh_live_pages_cnt;
+    int32_t curr_ru, gc_ru;
+    int32_t has_heap;       /* a persistently isolated handle's own heap */
+    uint64_t hbmw, mbmw, mbe;
+    uint64_t nvme_ruamw, nvme_hbmw, nvme_mbmw, nvme_mbe, event_filter;
+} StateRuh;
+
+static int32_t state_ru_id(struct ssd *ssd, FemuReclaimUnit *ru)
+{
+    return ru ? (int32_t)(ru->rgidx * ssd->rg[0].tt_nru + ru->ruidx) : -1;
+}
+
+static FemuReclaimUnit *state_ru(struct ssd *ssd, int32_t id)
+{
+    uint32_t nru = ssd->rg[0].tt_nru;
+
+    if (id < 0 || (uint32_t)id >= nru * ssd->nrg) {
+        return NULL;
+    }
+    return &ssd->rg[id / nru].rus[id % nru];
+}
+
+/* the victim heap a group's policy uses, as fdp_victim_heap() picks it */
+static pqueue_t *state_fdp_heap(struct ru_mgmt *rm)
+{
+    return rm->mgmt_type == GC_GLOBAL_CB ? rm->victim_ru_cb : rm->victim_ru_pq;
+}
+
+static bool state_write_ids(FILE *f, int32_t *ids, uint64_t k)
+{
+    return state_write(f, &k, sizeof(k)) &&
+           state_write(f, ids, sizeof(int32_t) * k);
+}
+
+static bool state_fdp_save(FILE *f, struct ssd *ssd)
+{
+    uint32_t nru = ssd->rg[0].tt_nru;
+    StateFdpHeader fh = {
+        .nrg = ssd->nrg, .nruhs = ssd->nruhs, .tt_nru = nru,
+        .lines_per_ru = ssd->sp.lines_per_ru,
+        .mgmt_type = ssd->rg[0].ru_mgmt->mgmt_type,
+        .written_bits = ssd->fdp_written_bits,
+    };
+    g_autofree int32_t *ids = g_new(int32_t, nru * ssd->nrg + 1);
+    bool ok = state_write(f, &fh, sizeof(fh));
+
+    for (uint32_t g = 0; g < ssd->nrg; g++) {
+        struct ru_mgmt *rm = ssd->rg[g].ru_mgmt;
+        pqueue_t *pq = state_fdp_heap(rm);
+        FemuReclaimUnit *ru;
+        uint64_t k = 0;
+
+        QTAILQ_FOREACH(ru, &rm->free_ru_list, entry) {
+            ids[k++] = state_ru_id(ssd, ru);
+        }
+        ok &= state_write_ids(f, ids, k);
+        k = 0;
+        QTAILQ_FOREACH(ru, &rm->full_ru_list, entry) {
+            ids[k++] = state_ru_id(ssd, ru);
+        }
+        ok &= state_write_ids(f, ids, k);
+        k = 0;
+        for (size_t i = 1; i < pq->size; i++) {
+            ids[k++] = state_ru_id(ssd, pq->d[i]);
+        }
+        ok &= state_write_ids(f, ids, k);
+        for (uint32_t j = 0; j < nru; j++) {
+            FemuReclaimUnit *u = &ssd->rg[g].rus[j];
+            StateRu sr = {
+                .ruh = u->ruh ? u->ruh->ruhid : -1,
+                .vpc = u->vpc, .ipc = u->ipc,
+                .line0 = u->lines[0]->id,
+                .utilization = u->utilization, .my_cb = u->my_cb,
+                .last_invalidated_time = u->last_invalidated_time,
+                .ruamw = u->nvme_ru ? u->nvme_ru->ruamw : 0,
+            };
+
+            state_put_wp(u->ssd_wptr, &sr.wp);
+            ok &= state_write(f, &sr, sizeof(sr));
+        }
+    }
+    for (uint32_t i = 0; i < ssd->nruhs; i++) {
+        FemuRuHandle *h = &ssd->ruhs[i];
+        StateRuh sh = { .present = h->ruh != NULL };
+
+        if (sh.present) {
+            sh.ru_in_use_cnt = h->ru_in_use_cnt;
+            sh.ruh_live_pages_cnt = h->ruh_live_pages_cnt;
+            sh.curr_ru = state_ru_id(ssd, h->curr_ru);
+            sh.gc_ru = state_ru_id(ssd, h->gc_ru);
+            sh.has_heap = h->ru_mgmt != NULL;
+            sh.hbmw = h->hbmw;
+            sh.mbmw = h->mbmw;
+            sh.mbe = h->mbe;
+            sh.nvme_ruamw = h->ruh->ruamw;
+            sh.nvme_hbmw = h->ruh->hbmw;
+            sh.nvme_mbmw = h->ruh->mbmw;
+            sh.nvme_mbe = h->ruh->mbe;
+            sh.event_filter = h->ruh->event_filter;
+        }
+        ok &= state_write(f, &sh, sizeof(sh));
+        if (!sh.present) {
+            continue;
+        }
+        for (uint32_t g = 0; g < ssd->nrg; g++) {
+            ids[g] = state_ru_id(ssd, h->rus[g]);
+        }
+        ok &= state_write(f, ids, sizeof(int32_t) * ssd->nrg);
+        if (sh.has_heap) {
+            pqueue_t *pq = h->ru_mgmt->victim_ru_pq;
+            uint64_t k = 0;
+
+            for (size_t j = 1; j < pq->size; j++) {
+                ids[k++] = state_ru_id(ssd, pq->d[j]);
+            }
+            ok &= state_write_ids(f, ids, k);
+        }
+    }
+    if (ssd->fdp_written) {
+        ok &= state_write(f, ssd->fdp_written, BITS_TO_LONGS(
+                          ssd->fdp_written_bits) * sizeof(unsigned long));
+    }
+    return ok;
+}
+
+static bool state_read_ids(FILE *f, struct ssd *ssd, int32_t **ids,
+                           uint64_t *k)
+{
+    uint64_t max = (uint64_t)ssd->rg[0].tt_nru * ssd->nrg;
+
+    if (!state_read(f, k, sizeof(*k)) || *k > max) {
+        return false;
+    }
+    g_free(*ids);
+    *ids = g_new(int32_t, *k + 1);
+    if (!state_read(f, *ids, sizeof(int32_t) * *k)) {
+        return false;
+    }
+    for (uint64_t i = 0; i < *k; i++) {
+        if (!state_ru(ssd, (*ids)[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int state_fdp_load(FILE *f, struct ssd *ssd, Error **errp)
+{
+    uint32_t nru = ssd->rg[0].tt_nru;
+    g_autofree int32_t *ids = NULL;
+    StateFdpHeader fh;
+    uint64_t k;
+
+    if (!state_read(f, &fh, sizeof(fh))) {
+        goto corrupt;
+    }
+    if (fh.nrg != ssd->nrg || fh.nruhs != ssd->nruhs || fh.tt_nru != nru ||
+        fh.lines_per_ru != ssd->sp.lines_per_ru ||
+        fh.mgmt_type != ssd->rg[0].ru_mgmt->mgmt_type ||
+        fh.written_bits != ssd->fdp_written_bits) {
+        error_setg(errp, "femu: precond_load: the state was saved with "
+                   "another FDP configuration (groups, handles, units or "
+                   "gc_strategy)");
+        return -1;
+    }
+
+    for (uint32_t g = 0; g < ssd->nrg; g++) {
+        struct ru_mgmt *rm = ssd->rg[g].ru_mgmt;
+        pqueue_t *pq = state_fdp_heap(rm);
+
+        /* a fresh FTL has queued no victim yet */
+        g_assert(pqueue_size(pq) == 0);
+        QTAILQ_INIT(&rm->free_ru_list);
+        QTAILQ_INIT(&rm->full_ru_list);
+        if (!state_read_ids(f, ssd, &ids, &k)) {
+            goto corrupt;
+        }
+        rm->free_ru_cnt = k;
+        for (uint64_t i = 0; i < k; i++) {
+            QTAILQ_INSERT_TAIL(&rm->free_ru_list, state_ru(ssd, ids[i]),
+                               entry);
+        }
+        if (!state_read_ids(f, ssd, &ids, &k)) {
+            goto corrupt;
+        }
+        for (uint64_t i = 0; i < k; i++) {
+            QTAILQ_INSERT_TAIL(&rm->full_ru_list, state_ru(ssd, ids[i]),
+                               entry);
+        }
+        if (!state_read_ids(f, ssd, &ids, &k)) {
+            goto corrupt;
+        }
+        for (uint32_t j = 0; j < nru; j++) {
+            FemuReclaimUnit *u = &ssd->rg[g].rus[j];
+            StateRu sr;
+
+            if (!state_read(f, &sr, sizeof(sr)) ||
+                sr.ruh >= (int32_t)ssd->nruhs) {
+                goto corrupt;
+            }
+            if (sr.line0 != u->lines[0]->id) {
+                error_setg(errp, "femu: precond_load: reclaim unit %u of "
+                           "group %u owns other lines here", j, g);
+                return -1;
+            }
+            u->ruh = sr.ruh < 0 ? NULL : &ssd->ruhs[sr.ruh];
+            u->vpc = sr.vpc;
+            u->ipc = sr.ipc;
+            u->utilization = sr.utilization;
+            u->my_cb = sr.my_cb;
+            u->last_invalidated_time = sr.last_invalidated_time;
+            u->reclaiming = false;
+            u->pos = 0;
+            u->ruh_pos = 0;
+            if (u->nvme_ru) {
+                u->nvme_ru->ruamw = sr.ruamw;
+            }
+            if (!state_get_wp(ssd, u->ssd_wptr, &sr.wp)) {
+                goto corrupt;
+            }
+        }
+        /* priorities are set: heap order rebuilds the same heap */
+        for (uint64_t i = 0; i < k; i++) {
+            pqueue_insert(pq, state_ru(ssd, ids[i]));
+        }
+    }
+    for (uint32_t i = 0; i < ssd->nruhs; i++) {
+        FemuRuHandle *h = &ssd->ruhs[i];
+        StateRuh sh;
+
+        if (!state_read(f, &sh, sizeof(sh)) ||
+            sh.present != (h->ruh != NULL) ||
+            (sh.present && sh.has_heap != (h->ru_mgmt != NULL))) {
+            goto corrupt;
+        }
+        if (!sh.present) {
+            continue;
+        }
+        h->ru_in_use_cnt = sh.ru_in_use_cnt;
+        h->ruh_live_pages_cnt = sh.ruh_live_pages_cnt;
+        h->curr_ru = state_ru(ssd, sh.curr_ru);
+        h->gc_ru = state_ru(ssd, sh.gc_ru);
+        h->hbmw = sh.hbmw;
+        h->mbmw = sh.mbmw;
+        h->mbe = sh.mbe;
+        h->ruh->ruamw = sh.nvme_ruamw;
+        h->ruh->hbmw = sh.nvme_hbmw;
+        h->ruh->mbmw = sh.nvme_mbmw;
+        h->ruh->mbe = sh.nvme_mbe;
+        h->ruh->event_filter = sh.event_filter;
+        g_free(ids);
+        ids = g_new(int32_t, ssd->nrg);
+        if (!state_read(f, ids, sizeof(int32_t) * ssd->nrg)) {
+            goto corrupt;
+        }
+        for (uint32_t g = 0; g < ssd->nrg; g++) {
+            h->rus[g] = state_ru(ssd, ids[g]);
+            h->ruh->rus[g] = h->rus[g] ? h->rus[g]->nvme_ru : &h->no_ru;
+        }
+        if (sh.has_heap) {
+            g_assert(pqueue_size(h->ru_mgmt->victim_ru_pq) == 0);
+            if (!state_read_ids(f, ssd, &ids, &k)) {
+                goto corrupt;
+            }
+            for (uint64_t j = 0; j < k; j++) {
+                pqueue_insert(h->ru_mgmt->victim_ru_pq, state_ru(ssd, ids[j]));
+            }
+        }
+    }
+    if (ssd->fdp_written &&
+        !state_read(f, ssd->fdp_written, BITS_TO_LONGS(
+                    ssd->fdp_written_bits) * sizeof(unsigned long))) {
+        goto corrupt;
+    }
+    return 0;
+
+corrupt:
+    error_setg(errp, "femu: precond_load: the FDP state is truncated or "
+               "corrupt");
+    return -1;
 }
 
 static bool state_save_ns(FILE *f, struct ssd *ssd, NvmeNamespace *ns)
@@ -244,6 +557,9 @@ static bool state_save_ns(FILE *f, struct ssd *ssd, NvmeNamespace *ns)
         ok &= state_write(f, tags.state, sizeof(uint64_t) * tags.nr_lpns);
         ok &= state_write(f, tags.completed, sizeof(uint32_t) * tags.nr_lpns);
     }
+    if (ssd->fdp_enabled) {
+        ok &= state_fdp_save(f, ssd);
+    }
     return ok;
 }
 
@@ -312,6 +628,11 @@ static int state_load_ns(FILE *f, struct ssd *ssd, NvmeNamespace *ns,
         error_setg(errp, "femu: precond_load: namespace %u was saved with "
                    "another geometry, size, LBA format or mapping",
                    ns->id);
+        return -1;
+    }
+    if (h.has_fdp != want.has_fdp) {
+        error_setg(errp, "femu: precond_load: the state was saved with FDP "
+                   "%s", h.has_fdp ? "on" : "off");
         return -1;
     }
     if (h.has_tag != want.has_tag) {
@@ -413,7 +734,7 @@ static int state_load_ns(FILE *f, struct ssd *ssd, NvmeNamespace *ns,
         error_setg(errp, "femu: precond_load: the state file is truncated");
         return -1;
     }
-    return 0;
+    return ssd->fdp_enabled ? state_fdp_load(f, ssd, errp) : 0;
 }
 
 /* every bbssd namespace of @n, in namespace order */

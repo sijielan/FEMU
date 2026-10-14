@@ -31458,15 +31458,18 @@ static void femu_test_precond(void *obj, void *data, QGuestAllocator *alloc)
     "pgs_per_blk=4,blks_per_pl=25,pls_per_lun=1,luns_per_ch=2,nchs=2"
 
 /*
- * Boot a controller with @opts, run the writes the guest owes when @replay
- * (precond=rand:1 with seed 7, done by hand), then a fixed run of random
- * page writes, and return the pages collection relocated during that run.
+ * Boot a controller with @opts after the devices in @pre, run the writes
+ * the guest owes when @replay (precond=rand:1 with seed 7, done by hand),
+ * then a fixed run of random page writes, placed on @nruh FDP handles when
+ * that is set, and return the pages collection relocated during that run.
  */
-static uint64_t femu_precond_run(const char *opts, bool replay)
+static uint64_t femu_precond_run(const char *pre, const char *opts,
+                                 bool replay, int nruh)
 {
     const uint32_t pages = 256;
-    QOSState *qs = qtest_pc_boot("-machine pc -nodefaults -device femu,id=mbe,"
-                                 "addr=5," FEMU_PRECOND_GEO "%s", opts);
+    QOSState *qs = qtest_pc_boot("-machine pc -nodefaults %s -device femu,"
+                                 "id=mbe,addr=5," FEMU_PRECOND_GEO "%s", pre,
+                                 opts);
     QPCIDevice *pdev = qpci_device_find(qs->pcibus, QPCI_DEVFN(5, 0));
     FemuCtrlState c = { 0 };
     uint64_t buf = guest_alloc(&qs->alloc, 4096);
@@ -31495,7 +31498,8 @@ static uint64_t femu_precond_run(const char *opts, bool replay)
     for (int i = 0; i < 600; i++) {
         seed = seed * 1103515245 + 12345;
         g_assert_cmphex(FEMU_SC(femu_write_pages_placed(
-                            &c, (seed >> 8) % pages, 1, buf, list, -1)), ==,
+                            &c, (seed >> 8) % pages, 1, buf, list,
+                            nruh ? (int)(seed >> 4) % nruh : -1)), ==,
                         NVME_SUCCESS);
     }
     before = femu_gc_pages(&c, list) - before;
@@ -31522,14 +31526,19 @@ static void femu_test_precond_save_load(void *obj, void *data,
     g_autofree char *dir = g_dir_make_tmp("femu-state-XXXXXX", NULL);
     g_autofree char *path = g_build_filename(dir, "ftl", NULL);
     g_autofree char *save = g_strdup_printf(",tag_check=on,precond=rand:2,"
-                                            "precond_save=%s", path);
-    g_autofree char *load = g_strdup_printf(",tag_check=on,precond_load=%s",
-                                            path);
+                                            "precond_save=%s%s", path,
+                                            data ? ",subsys=st" : "");
+    g_autofree char *load = g_strdup_printf(",tag_check=on,precond_load=%s%s",
+                                            path, data ? ",subsys=st" : "");
     g_autofree char *cmd = NULL;
-    uint64_t saved = femu_precond_run(save, false);
-    uint64_t loaded = femu_precond_run(load, false);
+    const char *pre = data ? "-device femu-subsys,id=st,nqn=st,fdp=on,"
+                             "fdp.nruh=4" : "";
+    int nruh = data ? 4 : 0;
+    uint64_t saved, loaded;
     QDict *rsp;
 
+    saved = femu_precond_run(pre, save, false, nruh);
+    loaded = femu_precond_run(pre, load, false, nruh);
     g_test_message("relocated after precond %" PRIu64 ", after loading its "
                    "state %" PRIu64, saved, loaded);
     g_assert_cmpuint(saved, >, 0);
@@ -31558,9 +31567,13 @@ static void femu_test_precond_save_load(void *obj, void *data,
 static void femu_test_precond_equivalent(void *obj, void *data,
                                          QGuestAllocator *unused)
 {
-    uint64_t precond = femu_precond_run(",precond=rand:1,precond_seed=7",
-                                        false);
-    uint64_t guest = femu_precond_run("", true);
+    const char *pre = data ? "-device femu-subsys,id=st,nqn=st,fdp=on,"
+                             "fdp.nruh=4" : "";
+    const char *sub = data ? ",subsys=st" : "";
+    g_autofree char *opts = g_strdup_printf(",precond=rand:1,precond_seed=7%s",
+                                            sub);
+    uint64_t precond = femu_precond_run(pre, opts, false, data ? 4 : 0);
+    uint64_t guest = femu_precond_run(pre, sub, true, data ? 4 : 0);
 
     g_test_message("relocated after precond %" PRIu64 ", after the guest's "
                    "writes %" PRIu64, precond, guest);
@@ -33002,8 +33015,13 @@ static void femu_register_nodes(void)
                                   "subsys=fdpsub" });
     qos_add_test("precond-equivalent", "femu", femu_test_precond_equivalent,
                  NULL);
+    qos_add_test("precond-equivalent-fdp", "femu",
+                 femu_test_precond_equivalent,
+                 &(QOSGraphTestOptions) { .arg = (void *)"fdp" });
     qos_add_test("precond-save-load", "femu", femu_test_precond_save_load,
                  NULL);
+    qos_add_test("precond-save-load-fdp", "femu", femu_test_precond_save_load,
+                 &(QOSGraphTestOptions) { .arg = (void *)"fdp" });
     qos_add_test("async-copy-hold", "femu", femu_test_async_copy_hold,
                  &(QOSGraphTestOptions) {
         .edge.extra_device_opts = FEMU_TAG_GEO ",async_copy=1" });

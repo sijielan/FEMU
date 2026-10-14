@@ -122,8 +122,8 @@ static const FemuPropDesc femu_ctrl_descs[] = {
       "geometry give the same FTL state" },
     { "precond_save",
       "Host file to keep the FTL state precond built in, for precond_load "
-      "to start from; page or dftl mapping without FDP, streams, "
-      "hot_cold_sep, gc_pace or blk_pe_limit" },
+      "to start from, FDP reclaim units included; page or dftl mapping "
+      "without streams, hot_cold_sep, gc_pace or blk_pe_limit" },
     { "precond_load",
       "Host file a precond_save run wrote: start every bbssd namespace "
       "from that FTL state instead of running precond; geometry, size, "
