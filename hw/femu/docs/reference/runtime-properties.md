@@ -30,6 +30,7 @@ or in the HMP monitor with `qom-get` and `qom-set`. Event counters are cleared b
 | Property | Type | Description |
 | --- | --- | --- |
 | `mbe-resident` | `uint64` | Read-only: bytes of the memory backend now in host memory; for mbe_type=file, the pages of mbe_file in the page cache |
+| `mbe-evicted` | `uint64` | Read-only: bytes of backend data the mbe_budget_mb thread has taken out of host memory since realize |
 
 ## `femu-cxl-ssd`: CXL Type-3 SSD
 

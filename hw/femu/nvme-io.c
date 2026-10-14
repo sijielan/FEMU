@@ -190,6 +190,46 @@ static inline void nvme_copy_cmd(NvmeCmd *dst, NvmeCmd *src)
 #endif
 }
 
+/* how far into a submission queue a sweep reads ahead */
+#define NVME_PREFETCH_MAX_SQES  256
+
+/*
+ * A poller copies a read's data before it takes the next command, so with a
+ * backend whose data may be on the host disk or in swap, a sweep over N
+ * reads that miss host memory waits for N host reads one after the other.
+ * Before the sweep, ask the host for the data of every read in @sq but the
+ * first, which is copied at once anyway. The misses then overlap and the
+ * sweep waits about as long as for the slowest of them. The commands are
+ * only peeked at, not consumed or checked: nvme_rw() still validates each.
+ */
+static void nvme_prefetch_sq_reads(FemuCtrl *n, NvmeSQueue *sq)
+{
+    NvmeCmd *ring = (NvmeCmd *)sq->dma_addr_hva;
+    uint32_t head = sq->head;
+    int reads = 0;
+
+    for (int i = 0; head != sq->tail && i < NVME_PREFETCH_MAX_SQES; i++) {
+        NvmeCmd cmd;
+        NvmeRwCmd *rw = (NvmeRwCmd *)&cmd;
+        NvmeNamespace *ns;
+        uint8_t shift;
+
+        nvme_copy_cmd(&cmd, &ring[head]);
+        head = head + 1 == sq->size ? 0 : head + 1;
+        if (rw->opcode != NVME_CMD_READ || !reads++) {
+            continue;
+        }
+        ns = nvme_ns(n, le32_to_cpu(rw->nsid));
+        if (!ns || !(NS_BBSSD(ns) || NS_NOSSD(ns))) {
+            continue;
+        }
+        shift = ns->id_ns.lbaf[NVME_ID_NS_FLBAS_INDEX(ns->id_ns.flbas)].lbads;
+        backend_prefetch(n->mbe, ns->backend_offset +
+                         (le64_to_cpu(rw->slba) << shift),
+                         ((uint64_t)le16_to_cpu(rw->nlb) + 1) << shift);
+    }
+}
+
 static void nvme_process_sq_io(void *opaque, int index_poller)
 {
     NvmeSQueue *sq = opaque;
@@ -216,6 +256,10 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
     bool did_isr = false;
 
     nvme_update_sq_tail(sq);
+    /* shared namespaces change under the subsystem lock, not taken here */
+    if (n->mbe->prefetch && sq->phys_contig && !nvme_ns_shared(n)) {
+        nvme_prefetch_sq_reads(n, sq);
+    }
     /*
      * One request per ring slot, handed to the FTL and only returned on
      * completion, so a guest that keeps submitting without waiting empties the

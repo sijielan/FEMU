@@ -2417,6 +2417,8 @@ typedef struct FemuCtrl {
     bool            mbe_thp;
     bool            mbe_lock;
     bool            mbe_pin_meta;
+    uint64_t        mbe_budget_mb;
+    bool            mbe_prefetch;
     FemuMbeConfig   mbe_cfg;    /* the above, parsed at realize */
     uint32_t        read_cache_mb; /* bbssd DRAM read cache size (0 = off) */
     uint32_t        mapping_cache_mb; /* bbssd DFTL translation cache size (0 = off) */

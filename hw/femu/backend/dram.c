@@ -211,6 +211,217 @@ fail:
     return -1;
 }
 
+/* How often the eviction thread compares the backend with its budget. */
+#define BACKEND_EVICT_MS        100
+/* Periods it takes to recount every chunk once, whether used or not. */
+#define BACKEND_EVICT_SWEEP     600
+
+static bool mbe_host_has_swap(void)
+{
+    g_autofree char *info = NULL;
+    const char *swap, *end;
+    uint64_t kb;
+
+    if (!g_file_get_contents("/proc/meminfo", &info, NULL, NULL)) {
+        return false;
+    }
+    swap = strstr(info, "\nSwapTotal:");
+    return swap && !qemu_strtou64(swap + strlen("\nSwapTotal:"), &end, 10,
+                                  &kb) && kb;
+}
+
+static uint64_t backend_chunk_len(SsdDramBackend *b, uint64_t c)
+{
+    uint64_t off = c << BACKEND_CHUNK_SHIFT;
+
+    return MIN((uint64_t)1 << BACKEND_CHUNK_SHIFT, (uint64_t)b->size - off);
+}
+
+/*
+ * Resident pages of [addr, addr + len), page aligned, counted @cap pages at a
+ * time into @buf (cap * 8 bytes). mincore() would do for file data but not
+ * for sparse data: a page MADV_PAGEOUT has written to swap stays in the swap
+ * cache, which mincore() reports as resident although the process no longer
+ * maps it. So sparse data is counted from /proc/self/pagemap, as pages
+ * present and mapped by this process alone, which also leaves out the
+ * shared zero page a read of a block never written maps in.
+ */
+static uint64_t backend_count_pages(SsdDramBackend *b, uintptr_t addr,
+                                    uint64_t len, void *buf, uint64_t cap)
+{
+    uint64_t pgsz = qemu_real_host_page_size();
+    uint64_t pages = 0;
+
+    while (len) {
+        uint64_t n = MIN(len / pgsz, cap);
+
+        if (b->pagemap_fd >= 0) {
+            uint64_t *pm = buf;
+            ssize_t got = pread(b->pagemap_fd, pm, n * sizeof(*pm),
+                                addr / pgsz * sizeof(*pm));
+
+            if (got != n * sizeof(*pm)) {
+                break;
+            }
+            for (uint64_t i = 0; i < n; i++) {
+                pages += (pm[i] >> 63) & (pm[i] >> 56) & 1;
+            }
+        } else {
+            unsigned char *vec = buf;
+
+            if (mincore((void *)addr, n * pgsz, vec)) {
+                break;
+            }
+            for (uint64_t i = 0; i < n; i++) {
+                pages += vec[i] & 1;
+            }
+        }
+        addr += n * pgsz;
+        len -= n * pgsz;
+    }
+    return pages;
+}
+
+/* Resident pages of chunk @c. The backend is page aligned, being mmap'd. */
+static uint16_t backend_count_chunk(SsdDramBackend *b, uint64_t c)
+{
+    uint64_t pgsz = qemu_real_host_page_size();
+    uint64_t buf[((uint64_t)1 << BACKEND_CHUNK_SHIFT) / 4096];
+
+    return backend_count_pages(b, (uintptr_t)b->logical_space +
+                               (c << BACKEND_CHUNK_SHIFT),
+                               ROUND_UP(backend_chunk_len(b, c), pgsz), buf,
+                               ARRAY_SIZE(buf));
+}
+
+/*
+ * Take chunk @c out of host memory. Sparse data goes to swap, where zswap
+ * may keep it compressed; MADV_PAGEOUT never drops it. File data is written
+ * back, unmapped from the process and then dropped from the page cache; a
+ * page the guest writes again meanwhile is dirty and stays. Nothing here
+ * loses data, so a poller may touch the chunk at any point and simply
+ * faults it back in.
+ */
+static void backend_evict_chunk(SsdDramBackend *b, uint64_t c)
+{
+    uint64_t off = c << BACKEND_CHUNK_SHIFT;
+    uint64_t len = backend_chunk_len(b, c);
+    uint8_t *addr = (uint8_t *)b->logical_space + off;
+
+    if (b->type == FEMU_MBE_SPARSE) {
+        madvise(addr, len, MADV_PAGEOUT);
+        return;
+    }
+    msync(addr, len, MS_SYNC);
+    qemu_madvise(addr, len, QEMU_MADV_DONTNEED);
+    posix_fadvise(b->fd, off, len, POSIX_FADV_DONTNEED);
+}
+
+/*
+ * Keep the backend's resident data within mbe_budget_mb from a thread of
+ * its own, so a poller rarely meets reclaim in a page fault; a cgroup memory
+ * limit then serves only as the last resort. Counting every page of a large
+ * backend takes the better part of a second, so the thread counts only the
+ * chunks used since it last looked, plus a slice of all of them that
+ * catches what the kernel reclaimed on its own. When over budget it evicts
+ * chunks by CLOCK, passing over those used since the hand last came by,
+ * until it is 1/16 below the budget.
+ */
+static void *backend_evict_thread(void *opaque)
+{
+    SsdDramBackend *b = opaque;
+    uint64_t pgsz = qemu_real_host_page_size();
+    uint64_t slice = DIV_ROUND_UP(b->nr_chunks, BACKEND_EVICT_SWEEP);
+    uint64_t target = b->budget - b->budget / 16;
+    uint64_t resident = 0;
+    uint64_t sweep = 0;
+    uint64_t hand = 0;
+
+    rcu_register_thread();
+    /* behind the pollers and FTL threads when they share a CPU */
+    if (setpriority(PRIO_PROCESS, qemu_get_thread_id(), 10)) {
+        femu_err("backend: cannot lower the eviction thread's priority\n");
+    }
+    while (!qatomic_read(&b->evict_stop)) {
+        for (uint64_t c = 0; c < b->nr_chunks; c++) {
+            bool sweeping = c - sweep < slice;
+
+            if (!(qatomic_read(&b->chunk_flags[c]) & BACKEND_CHUNK_SEEN) &&
+                !sweeping) {
+                continue;
+            }
+            qatomic_fetch_and(&b->chunk_flags[c], ~BACKEND_CHUNK_SEEN);
+            resident -= (uint64_t)b->chunk_pages[c] * pgsz;
+            b->chunk_pages[c] = backend_count_chunk(b, c);
+            resident += (uint64_t)b->chunk_pages[c] * pgsz;
+        }
+        sweep = sweep + slice >= b->nr_chunks ? 0 : sweep + slice;
+
+        for (uint64_t scanned = 0; resident > target &&
+             scanned < 2 * b->nr_chunks && !qatomic_read(&b->evict_stop);
+             scanned++) {
+            uint64_t c = hand;
+            uint16_t left;
+
+            hand = hand + 1 == b->nr_chunks ? 0 : hand + 1;
+            if (qatomic_fetch_and(&b->chunk_flags[c], ~BACKEND_CHUNK_REF) &
+                BACKEND_CHUNK_REF) {
+                continue;
+            }
+            if (!b->chunk_pages[c]) {
+                continue;
+            }
+            backend_evict_chunk(b, c);
+            left = backend_count_chunk(b, c);
+            if (left < b->chunk_pages[c]) {
+                qatomic_add(&b->evicted,
+                            (uint64_t)(b->chunk_pages[c] - left) * pgsz);
+            }
+            resident -= (uint64_t)b->chunk_pages[c] * pgsz;
+            resident += (uint64_t)left * pgsz;
+            b->chunk_pages[c] = left;
+        }
+        qemu_sem_timedwait(&b->evict_sem, BACKEND_EVICT_MS);
+    }
+    rcu_unregister_thread();
+    return NULL;
+}
+
+static int backend_start_eviction(SsdDramBackend *b, uint64_t budget,
+                                  Error **errp)
+{
+    if (b->type == FEMU_MBE_SPARSE && !mbe_host_has_swap()) {
+        error_setg(errp, "femu: mbe_budget_mb with mbe_type=sparse evicts to "
+                   "swap, and the host has none; add swap (zswap keeps it "
+                   "compressed in memory) or use mbe_type=file");
+        return -1;
+    }
+    b->budget = budget;
+    b->nr_chunks = DIV_ROUND_UP(b->size, (uint64_t)1 << BACKEND_CHUNK_SHIFT);
+    b->chunk_flags = g_new0(uint8_t, b->nr_chunks);
+    b->chunk_pages = g_new0(uint16_t, b->nr_chunks);
+    qemu_sem_init(&b->evict_sem, 0);
+    qemu_thread_create(&b->evict_thread, "femu-mbe-evict",
+                       backend_evict_thread, b, QEMU_THREAD_JOINABLE);
+    return 0;
+}
+
+static void backend_stop_eviction(SsdDramBackend *b)
+{
+    if (!b->budget) {
+        return;
+    }
+    qatomic_set(&b->evict_stop, true);
+    qemu_sem_post(&b->evict_sem);
+    qemu_thread_join(&b->evict_thread);
+    qemu_sem_destroy(&b->evict_sem);
+    g_free(b->chunk_flags);
+    g_free(b->chunk_pages);
+    b->chunk_flags = NULL;
+    b->chunk_pages = NULL;
+    b->budget = 0;
+}
+
 int init_dram_backend(SsdDramBackend **mbe, int64_t nbytes,
                       const FemuMbeConfig *cfg, Error **errp)
 {
@@ -221,6 +432,7 @@ int init_dram_backend(SsdDramBackend **mbe, int64_t nbytes,
         b = *mbe = g_malloc0(sizeof(SsdDramBackend));
         b->size = nbytes;
         b->fd = -1;
+        b->pagemap_fd = -1;
         b->logical_space = g_malloc0(nbytes);
 
         /* bind to the requested NUMA node before mlock faults the pages in */
@@ -260,6 +472,8 @@ int init_dram_backend(SsdDramBackend **mbe, int64_t nbytes,
     b->size = nbytes;
     b->type = cfg->type;
     b->fd = fd;
+    b->pagemap_fd = -1;
+    b->prefetch = cfg->prefetch;
     b->logical_space = mbe_map(nbytes, fd, errp);
     if (!b->logical_space) {
         if (fd >= 0) {
@@ -270,6 +484,8 @@ int init_dram_backend(SsdDramBackend **mbe, int64_t nbytes,
     }
 
     if (cfg->type == FEMU_MBE_SPARSE) {
+        /* see backend_count_pages(); without it, fall back to mincore() */
+        b->pagemap_fd = qemu_open_old("/proc/self/pagemap", O_RDONLY);
         /*
          * A huge page takes 2 MiB for a 4 KiB write, and a deallocate of part
          * of one splits it rather than frees it, so the default keeps the
@@ -281,18 +497,23 @@ int init_dram_backend(SsdDramBackend **mbe, int64_t nbytes,
         if (cfg->lock) {
             if (mlock2(b->logical_space, nbytes, MLOCK_ONFAULT)) {
                 error_setg_errno(errp, errno, "femu: mbe_lock: mlock2 failed");
-                munmap(b->logical_space, nbytes);
-                g_free(b);
+                free_dram_backend(b);
                 return -1;
             }
             b->locked = true;
         }
     }
 
-    femu_log("backend: %" PRId64 " MiB %s backend%s%s\n", nbytes / MiB,
+    if (cfg->budget && backend_start_eviction(b, cfg->budget, errp)) {
+        free_dram_backend(b);
+        return -1;
+    }
+
+    femu_log("backend: %" PRId64 " MiB %s backend%s%s, budget %" PRIu64
+             " MiB\n", nbytes / MiB,
              cfg->type == FEMU_MBE_FILE ? "file" : "sparse",
              cfg->type == FEMU_MBE_FILE ? " on " : "",
-             cfg->type == FEMU_MBE_FILE ? cfg->file : "");
+             cfg->type == FEMU_MBE_FILE ? cfg->file : "", cfg->budget / MiB);
     *mbe = b;
     backend_init_range_locks(b);
 
@@ -343,35 +564,44 @@ void backend_zero_range(SsdDramBackend *b, uint64_t off, uint64_t len)
 }
 
 /*
+ * Ask the host to bring [off, off + len) into memory without waiting for it:
+ * a file backend starts reading the range from the file, a sparse one
+ * starts reading it back from swap. Out-of-range requests are ignored; this
+ * is a hint, and the access that follows checks the range itself.
+ */
+void backend_prefetch(SsdDramBackend *b, uint64_t off, uint64_t len)
+{
+    uint64_t pgsz = qemu_real_host_page_size();
+    uint64_t start, end;
+
+    if (!len || off > (uint64_t)b->size || len > (uint64_t)b->size - off) {
+        return;
+    }
+    start = QEMU_ALIGN_DOWN(off, pgsz);
+    end = ROUND_UP(off + len, pgsz);
+    qemu_madvise((uint8_t *)b->logical_space + start, end - start,
+                 QEMU_MADV_WILLNEED);
+}
+
+/*
  * Bytes of the backing store in host memory: for a file backend, the pages
- * of the file in the page cache. Walked in 1 GiB steps to keep the mincore
- * vector small.
+ * of the file in the page cache. A walk of a backend of some TiB takes the
+ * better part of a second.
  */
 uint64_t backend_resident_bytes(SsdDramBackend *b)
 {
+    const uint64_t cap = 64 * KiB;
     uint64_t pgsz = qemu_real_host_page_size();
-    uintptr_t start, end, addr;
-    uint64_t resident = 0;
-    g_autofree unsigned char *vec = NULL;
+    g_autofree uint64_t *buf = NULL;
+    uintptr_t start, end;
 
     if (!b || !b->logical_space || !b->size) {
         return 0;
     }
     start = QEMU_ALIGN_DOWN((uintptr_t)b->logical_space, pgsz);
     end = ROUND_UP((uintptr_t)b->logical_space + b->size, pgsz);
-    vec = g_malloc(GiB / pgsz);
-    for (addr = start; addr < end; addr += GiB) {
-        uint64_t len = MIN(GiB, end - addr);
-        uint64_t n = len / pgsz;
-
-        if (mincore((void *)addr, len, vec)) {
-            break;
-        }
-        for (uint64_t i = 0; i < n; i++) {
-            resident += vec[i] & 1;
-        }
-    }
-    return resident * pgsz;
+    buf = g_new(uint64_t, cap);
+    return backend_count_pages(b, start, end - start, buf, cap) * pgsz;
 }
 
 /* A backend another device lends takes its locks from the borrower. */
@@ -403,6 +633,7 @@ void free_dram_backend(SsdDramBackend *b)
     if (!b) {
         return;
     }
+    backend_stop_eviction(b);
     if (b->logical_space && b->type != FEMU_MBE_DRAM) {
         munmap(b->logical_space, b->size);
     } else if (b->logical_space) {
@@ -411,6 +642,9 @@ void free_dram_backend(SsdDramBackend *b)
     }
     if (b->type == FEMU_MBE_FILE && b->fd >= 0) {
         qemu_close(b->fd);
+    }
+    if (b->type == FEMU_MBE_SPARSE && b->pagemap_fd >= 0) {
+        qemu_close(b->pagemap_fd);
     }
     backend_free_range_locks(b);
     g_free(b);
@@ -449,12 +683,35 @@ static int backend_range_runs(uint64_t off, uint64_t len, int run[2][2])
  * Make an access to [off, off + len) of the backing store atomic with
  * respect to every other access that takes the locks of its range.
  */
+/* Tell the eviction thread that [off, off + len) is in use. */
+static inline void backend_mark_chunks(SsdDramBackend *b, uint64_t off,
+                                       uint64_t len)
+{
+    uint64_t c = off >> BACKEND_CHUNK_SHIFT;
+    uint64_t last = MIN((off + len - 1) >> BACKEND_CHUNK_SHIFT,
+                        b->nr_chunks - 1);
+    const uint8_t all = BACKEND_CHUNK_REF | BACKEND_CHUNK_SEEN;
+
+    for (; c <= last; c++) {
+        /* a store only on change keeps pollers off each other's lines */
+        if (qatomic_read(&b->chunk_flags[c]) != all) {
+            qatomic_set(&b->chunk_flags[c], all);
+        }
+    }
+}
+
 void backend_lock_range(SsdDramBackend *b, uint64_t off, uint64_t len)
 {
     int run[2][2];
     int nr, r, i;
 
-    if (!b || !b->range_locks || !len) {
+    if (!b || !len) {
+        return;
+    }
+    if (b->chunk_flags) {
+        backend_mark_chunks(b, off, len);
+    }
+    if (!b->range_locks) {
         return;
     }
     nr = backend_range_runs(off, len, run);

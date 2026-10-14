@@ -90,6 +90,16 @@ static const FemuPropDesc femu_ctrl_descs[] = {
       "backend data as it is touched (mlockall), so FTL metadata and FEMU "
       "threads never page out; needs RLIMIT_MEMLOCK unlimited, off only for "
       "unprivileged runs" },
+    { "mbe_budget_mb",
+      "mbe_type=sparse or file: MiB of backend data to keep in host memory; "
+      "a background thread evicts the least recently used 2 MiB chunks "
+      "above it, sparse ones to swap (which the host must have); 0 (the "
+      "default) evicts nothing" },
+    { "mbe_prefetch",
+      "mbe_type=sparse or file: before a poller runs the reads waiting in a "
+      "queue, ask the host for all their data at once (MADV_WILLNEED), so "
+      "reads that miss host memory wait together rather than one by one; "
+      "on by default" },
     { "namespaces",
       "Number of namespaces created at boot, 1 to 256; OCSSD and FDP "
       "support only 1" },
@@ -737,6 +747,9 @@ static const FemuPropDesc femu_ctrl_runtime_descs[] = {
     { "mbe-resident",
       "Read-only: bytes of the memory backend now in host memory; for "
       "mbe_type=file, the pages of mbe_file in the page cache" },
+    { "mbe-evicted",
+      "Read-only: bytes of backend data the mbe_budget_mb thread has taken "
+      "out of host memory since realize" },
     { NULL, NULL }
 };
 

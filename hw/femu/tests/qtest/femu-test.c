@@ -30948,15 +30948,21 @@ static void femu_test_compare_verify_zns(void *obj, void *data,
     femu_disable(&c);
 }
 
-static uint64_t femu_mbe_resident(QTestState *qts)
+/* a uint64 property of the controller with id=mbe */
+static uint64_t femu_mbe_get(QTestState *qts, const char *prop)
 {
     QDict *rsp = qtest_qmp(qts, "{'execute':'qom-get','arguments':{"
                            "'path':'/machine/peripheral/mbe',"
-                           "'property':'mbe-resident'}}");
+                           "'property':%s}}", prop);
     uint64_t value = qdict_get_int(rsp, "return");
 
     qobject_unref(rsp);
     return value;
+}
+
+static uint64_t femu_mbe_resident(QTestState *qts)
+{
+    return femu_mbe_get(qts, "mbe-resident");
 }
 
 /*
@@ -31045,6 +31051,120 @@ static void femu_test_mbe_lazy(void *obj, void *data, QGuestAllocator *unused)
     rmdir(dir);
 }
 
+/* SwapTotal in /proc/meminfo, which a sparse backend evicts to */
+static bool femu_host_has_swap(void)
+{
+    g_autofree char *info = NULL;
+    const char *swap;
+
+    if (!g_file_get_contents("/proc/meminfo", &info, NULL, NULL)) {
+        return false;
+    }
+    swap = strstr(info, "\nSwapTotal:");
+    return swap && g_ascii_strtoull(swap + strlen("\nSwapTotal:"), NULL,
+                                    10);
+}
+
+/*
+ * With mbe_budget_mb the eviction thread takes data out of host memory
+ * until the backend is within budget: a file backend's is written back and
+ * dropped from the page cache, a sparse backend's goes to swap. The data
+ * reads back intact afterwards, also when a burst of reads is queued at
+ * once, which is what mbe_prefetch reads ahead for.
+ */
+static void femu_test_mbe_budget(void *obj, void *data,
+                                 QGuestAllocator *unused)
+{
+    const bool file = data != NULL;
+    const uint32_t pages = 2048;     /* 8 MiB, against a 2 MiB budget */
+    const uint32_t burst = 8;
+    g_autofree char *dir = NULL;
+    g_autofree char *path = NULL;
+    g_autofree char *type = NULL;
+    QOSState *qs;
+    QTestState *qts;
+    QPCIDevice *pdev;
+    FemuCtrlState c = { 0 };
+    uint64_t buf;
+    uint8_t got[FEMU_DATA_SIZE];
+    uint64_t stride, resident = 0;
+    uint32_t i, j, k;
+    int waited;
+
+    if (!file && !femu_host_has_swap()) {
+        g_test_skip("a sparse backend evicts to swap, and the host has none");
+        return;
+    }
+    dir = g_dir_make_tmp("femu-mbe-XXXXXX", NULL);
+    path = g_build_filename(dir, "backend", NULL);
+    type = file ? g_strdup_printf("file,mbe_file=%s", path)
+                : g_strdup("sparse");
+    qs = qtest_pc_boot(
+        "-machine pc -nodefaults -device femu,id=mbe,addr=5,devsz_mb=64,"
+        "femu_mode=2,mbe_type=%s,mbe_budget_mb=2,mbe_pin_meta=off", type);
+    qts = qs->qts;
+    pdev = qpci_device_find(qs->pcibus, QPCI_DEVFN(5, 0));
+    buf = guest_alloc(&qs->alloc, FEMU_DATA_SIZE * burst);
+
+    femu_enable(&c, pdev, &qs->alloc);
+    femu_create_io_queues(&c);
+    stride = FEMU_DATA_SIZE / c.lba_size;
+    for (i = 0; i < pages; i++) {
+        qtest_memset(qts, buf, i * 7 + 1, FEMU_DATA_SIZE);
+        g_assert_cmphex(femu_rw(&c, NVME_CMD_WRITE, i * stride, buf), ==,
+                        NVME_SUCCESS);
+    }
+    for (waited = 0; waited < 10000; waited += 50) {
+        resident = femu_mbe_resident(qts);
+        if (resident <= (2ull << 20)) {
+            break;
+        }
+        g_usleep(50 * 1000);
+    }
+    g_test_message("resident %" PRIu64 " KiB, evicted %" PRIu64 " KiB",
+                   resident >> 10, femu_mbe_get(qts, "mbe-evicted") >> 10);
+    g_assert_cmpuint(resident, <=, (2ull << 20));
+    g_assert_cmpuint(femu_mbe_get(qts, "mbe-evicted"), >=,
+                     (pages * FEMU_DATA_SIZE) - (2ull << 20));
+
+    for (i = 0; i + burst <= pages; i += 251) {
+        for (k = 0; k < burst; k++) {
+            NvmeRwCmd rw = { 0 };
+
+            rw.opcode = NVME_CMD_READ;
+            rw.cid = cpu_to_le16(c.cid++);
+            rw.nsid = cpu_to_le32(1);
+            rw.dptr.prp1 = cpu_to_le64(buf + k * FEMU_DATA_SIZE);
+            rw.slba = cpu_to_le64((uint64_t)(i + k) * stride);
+            rw.nlb = cpu_to_le16(stride - 1);
+            qtest_memwrite(qts, c.io.sq_addr + c.io.sq_tail * sizeof(NvmeCmd),
+                           &rw, sizeof(rw));
+            c.io.sq_tail = (c.io.sq_tail + 1) % FEMU_QSIZE;
+        }
+        qpci_io_writel(pdev, c.bar, femu_sq_doorbell(&c, c.io.qid),
+                       c.io.sq_tail);
+        for (k = 0; k < burst; k++) {
+            g_assert_cmphex(FEMU_SC(femu_complete(&c, &c.io, NULL, NULL)), ==,
+                            NVME_SUCCESS);
+        }
+        for (k = 0; k < burst; k++) {
+            qtest_memread(qts, buf + k * FEMU_DATA_SIZE, got, sizeof(got));
+            for (j = 0; j < sizeof(got); j++) {
+                g_assert_cmpint(got[j], ==, (uint8_t)((i + k) * 7 + 1));
+            }
+        }
+    }
+
+    femu_disable(&c);
+    guest_free(&qs->alloc, buf);
+    g_free(pdev);
+    qtest_pc_shutdown(qs);
+    if (file) {
+        unlink(path);
+    }
+    rmdir(dir);
+}
+
 /* mbe_* settings a backend type does not read fail realize */
 static void femu_test_mbe_refused(void *obj, void *data,
                                   QGuestAllocator *alloc)
@@ -31056,6 +31176,10 @@ static void femu_test_mbe_refused(void *obj, void *data,
         { "'mbe_thp':true", "need mbe_type=sparse or file" },
         { "'mbe_pin_meta':false", "need mbe_type=sparse or file" },
         { "'mbe_file':'/nonexistent/x'", "need mbe_type=sparse or file" },
+        { "'mbe_budget_mb':8", "need mbe_type=sparse or file" },
+        { "'mbe_prefetch':false", "need mbe_type=sparse or file" },
+        { "'mbe_type':'sparse','mbe_pin_meta':false,'mbe_lock':true,"
+          "'mbe_budget_mb':8", "leaves mbe_budget_mb nothing to evict" },
         { "'mbe_type':'file','mbe_pin_meta':false", "mbe_file is required" },
         { "'mbe_type':'sparse','mbe_pin_meta':false,"
           "'mbe_file':'/nonexistent/x'", "mbe_file is not used" },
@@ -32086,6 +32210,9 @@ static void femu_register_nodes(void)
     qos_add_test("mbe-file", "femu", femu_test_mbe_lazy,
                  &(QOSGraphTestOptions) { .arg = (void *)"file" });
     qos_add_test("mbe-refused", "femu", femu_test_mbe_refused, NULL);
+    qos_add_test("mbe-budget-file", "femu", femu_test_mbe_budget,
+                 &(QOSGraphTestOptions) { .arg = (void *)"file" });
+    qos_add_test("mbe-budget-sparse", "femu", femu_test_mbe_budget, NULL);
     qos_add_test("pel-file-quit-media", "femu", femu_test_pel_file_quit,
                  &(QOSGraphTestOptions) { .arg = GINT_TO_POINTER(1) });
     qos_add_test("pel-file-invalid", "femu", femu_test_pel_file_invalid, NULL);

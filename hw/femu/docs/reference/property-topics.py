@@ -34,7 +34,7 @@ DEVICES = [
                 "kind": "static",
                 "props": [
                     "mbe_type", "mbe_file", "mbe_thp", "mbe_lock",
-                    "mbe_pin_meta",
+                    "mbe_pin_meta", "mbe_budget_mb", "mbe_prefetch",
                 ],
             },
             {
@@ -184,7 +184,7 @@ DEVICES = [
                 "title": "Memory backend usage",
                 "kind": "runtime",
                 "props": [
-                    "mbe-resident",
+                    "mbe-resident", "mbe-evicted",
                 ],
             },
         ],

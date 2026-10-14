@@ -2639,13 +2639,22 @@ static bool femu_check_mbe_props(FemuCtrl *n, Error **errp)
     cfg->thp = n->mbe_thp;
     cfg->lock = n->mbe_lock;
     cfg->pin_meta = n->mbe_pin_meta;
+    cfg->budget = n->mbe_budget_mb * MiB;
+    cfg->prefetch = n->mbe_prefetch;
     if (cfg->type == FEMU_MBE_DRAM) {
-        if (n->mbe_file || n->mbe_thp || n->mbe_lock || !n->mbe_pin_meta) {
-            error_setg(errp, "femu: mbe_file, mbe_thp, mbe_lock and "
-                       "mbe_pin_meta need mbe_type=sparse or file");
+        if (n->mbe_file || n->mbe_thp || n->mbe_lock || !n->mbe_pin_meta ||
+            n->mbe_budget_mb || !n->mbe_prefetch) {
+            error_setg(errp, "femu: mbe_file, mbe_thp, mbe_lock, "
+                       "mbe_pin_meta, mbe_budget_mb and mbe_prefetch need "
+                       "mbe_type=sparse or file");
             return false;
         }
         return true;
+    }
+    if (n->mbe_lock && n->mbe_budget_mb) {
+        error_setg(errp, "femu: mbe_lock keeps written data resident, which "
+                   "leaves mbe_budget_mb nothing to evict");
+        return false;
     }
     if (n->cxl_dev) {
         error_setg(errp, "femu: mbe_type=%s cannot be used with cxl_ssd, "
@@ -3312,6 +3321,8 @@ static const Property femu_props[] = {
     DEFINE_PROP_BOOL("mbe_thp", FemuCtrl, mbe_thp, false),
     DEFINE_PROP_BOOL("mbe_lock", FemuCtrl, mbe_lock, false),
     DEFINE_PROP_BOOL("mbe_pin_meta", FemuCtrl, mbe_pin_meta, true),
+    DEFINE_PROP_UINT64("mbe_budget_mb", FemuCtrl, mbe_budget_mb, 0),
+    DEFINE_PROP_BOOL("mbe_prefetch", FemuCtrl, mbe_prefetch, true),
     DEFINE_PROP_UINT32("namespaces", FemuCtrl, num_namespaces, 1),
     DEFINE_PROP_UINT32("queues", FemuCtrl, nr_io_queues, 8),
     DEFINE_PROP_UINT32("entries", FemuCtrl, max_q_ents, 0x7ff),
@@ -3853,11 +3864,22 @@ static void femu_mbe_resident_get(Object *obj, Visitor *v, const char *name,
     visit_type_uint64(v, name, &value, errp);
 }
 
+static void femu_mbe_evicted_get(Object *obj, Visitor *v, const char *name,
+                                 void *opaque, Error **errp)
+{
+    SsdDramBackend *b = FEMU(obj)->mbe;
+    uint64_t value = b ? qatomic_read(&b->evicted) : 0;
+
+    visit_type_uint64(v, name, &value, errp);
+}
+
 static void femu_instance_init(Object *obj)
 {
     object_property_add_bool(obj, "simulate-power-loss", NULL,
                              femu_simulate_power_loss);
     object_property_add(obj, "mbe-resident", "uint64", femu_mbe_resident_get,
+                        NULL, NULL, NULL);
+    object_property_add(obj, "mbe-evicted", "uint64", femu_mbe_evicted_get,
                         NULL, NULL, NULL);
     femu_ctrl_describe_runtime(obj);
     if (qtest_enabled()) {
