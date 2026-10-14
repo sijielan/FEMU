@@ -31843,6 +31843,57 @@ static void femu_test_async_copy_data(void *obj, void *data,
     qos_invalidate_command_line();
 }
 
+/*
+ * The bbssd FTL counts sectors and pages in 64 bits: 2 TiB of NAND, 2^32
+ * sectors of 512 bytes, used to fail realize past 2^31. 128 KiB FTL pages
+ * keep its tables small and 4 KiB blocks the namespace's bitmaps; the data
+ * lands in a sparse backend past 1 TiB and reads back.
+ */
+static void femu_test_geometry_2t(void *obj, void *data, QGuestAllocator *unused)
+{
+    QOSState *qs = qtest_pc_boot(
+        "-machine pc -nodefaults -device femu,id=mbe,addr=5,devsz_mb=1572864,"
+        "femu_mode=1,lba_index=3,secs_per_pg=256,pgs_per_blk=64,"
+        "blks_per_pl=4096,pls_per_lun=1,luns_per_ch=8,nchs=8,"
+        "mbe_type=sparse,mbe_pin_meta=off");
+    QTestState *qts = qs->qts;
+    QPCIDevice *pdev = qpci_device_find(qs->pcibus, QPCI_DEVFN(5, 0));
+    FemuCtrlState c = { 0 };
+    uint64_t buf = guest_alloc(&qs->alloc, 4096);
+    uint64_t nsze, lbas[2];
+    uint32_t lba_size;
+    uint8_t got[FEMU_DATA_SIZE];
+
+    femu_enable(&c, pdev, &qs->alloc);
+    femu_create_io_queues(&c);
+    femu_identify_ns(&c, &nsze, &lba_size);
+    g_assert_cmpuint(lba_size, ==, 4096);
+    g_assert_cmpuint(nsze * lba_size, ==, 1572864ull << 20);
+    c.lba_size = lba_size;
+    lbas[0] = nsze - 1;                         /* the last block */
+    lbas[1] = (1ull << 40) / lba_size + 7;     /* just past 1 TiB */
+    for (int i = 0; i < 2; i++) {
+        qtest_memset(qts, buf, 0x40 + i, FEMU_DATA_SIZE);
+        g_assert_cmphex(femu_rw(&c, NVME_CMD_WRITE, lbas[i], buf), ==,
+                        NVME_SUCCESS);
+    }
+    for (int i = 0; i < 2; i++) {
+        qtest_memset(qts, buf, 0, FEMU_DATA_SIZE);
+        g_assert_cmphex(femu_rw(&c, NVME_CMD_READ, lbas[i], buf), ==,
+                        NVME_SUCCESS);
+        qtest_memread(qts, buf, got, sizeof(got));
+        for (int j = 0; j < sizeof(got); j++) {
+            g_assert_cmpint(got[j], ==, 0x40 + i);
+        }
+    }
+    g_assert_cmpuint(femu_mbe_get(qts, "mbe-resident"), <, 64 << 20);
+
+    femu_disable(&c);
+    guest_free(&qs->alloc, buf);
+    g_free(pdev);
+    qtest_pc_shutdown(qs);
+}
+
 /* mbe_* settings a backend type does not read fail realize */
 static void femu_test_mbe_refused(void *obj, void *data,
                                   QGuestAllocator *alloc)
@@ -32988,6 +33039,7 @@ static void femu_register_nodes(void)
                  &(QOSGraphTestOptions) { .arg = (void *)"file" });
     qos_add_test("mbe-budget-sparse", "femu", femu_test_mbe_budget, NULL);
     qos_add_test("mbe-tiers", "femu", femu_test_mbe_tiers, NULL);
+    qos_add_test("geometry-2t", "femu", femu_test_geometry_2t, NULL);
     qos_add_test("pel-file-quit-media", "femu", femu_test_pel_file_quit,
                  &(QOSGraphTestOptions) { .arg = GINT_TO_POINTER(1) });
     qos_add_test("pel-file-invalid", "femu", femu_test_pel_file_invalid, NULL);

@@ -71,11 +71,11 @@ int bb_pd_wl_pages(FemuCtrl *n)
  * axis of zero or less divides by zero on the datapath -- an LBA becomes a page
  * by dividing by secs_per_pg -- or allocates an empty array the FTL still
  * indexes. Separately, an axis that fits its own PPA field can still overflow
- * the derived totals: those are held in int, and the sector count is the
- * product of every axis, so per-axis values that are each legal can push the
- * aggregate past INT_MAX and wrap negative. Compute the aggregate in 64-bit
- * here and reject it, rather than letting ssd_init() allocate from a wrapped
- * count.
+ * the derived totals: the page count is the product of every axis, so
+ * per-axis values that are each legal can push it past what the FTL
+ * addresses. The totals that grow with capacity are 64-bit; the bound is
+ * the 40-bit logical page of a tag_check tag. Compute the aggregate here and
+ * reject it, rather than letting ssd_init() allocate for it.
  */
 int bb_check_geometry(FemuCtrl *n, Error **errp)
 {
@@ -228,13 +228,17 @@ int bb_check_geometry(FemuCtrl *n, Error **errp)
         return -1;
     }
 
+    /*
+     * The FTL addresses pages with 64-bit counts; what bounds it is the
+     * 40-bit logical page a tag_check tag holds, 4 PiB of 4 KiB pages.
+     */
     tt_secs = (uint64_t)p->secs_per_pg * p->pgs_per_blk * p->blks_per_pl *
               p->pls_per_lun * p->luns_per_ch * p->nchs;
-    if (tt_secs > INT_MAX) {
-        error_setg(errp, "FEMU bbssd: the geometry describes %" PRIu64 " sectors, "
-                   "which exceeds the %d the FTL can address; reduce one of "
-                   "secs_per_pg, pgs_per_blk, blks_per_pl, pls_per_lun, "
-                   "luns_per_ch or nchs", tt_secs, INT_MAX);
+    if (tt_secs / p->secs_per_pg >= (1ull << 40)) {
+        error_setg(errp, "FEMU bbssd: the geometry describes %" PRIu64 " pages, "
+                   "which exceeds the 2^40 the FTL can address; reduce one of "
+                   "pgs_per_blk, blks_per_pl, pls_per_lun, luns_per_ch or "
+                   "nchs", tt_secs / p->secs_per_pg);
         return -1;
     }
 
@@ -314,12 +318,12 @@ void ssd_init_params(struct ssdparams *spp, FemuCtrl *n)
 
     /* calculated values */
     spp->secs_per_blk = spp->secs_per_pg * spp->pgs_per_blk;
-    spp->secs_per_pl = spp->secs_per_blk * spp->blks_per_pl;
+    spp->secs_per_pl = (int64_t)spp->secs_per_blk * spp->blks_per_pl;
     spp->secs_per_lun = spp->secs_per_pl * spp->pls_per_lun;
     spp->secs_per_ch = spp->secs_per_lun * spp->luns_per_ch;
     spp->tt_secs = spp->secs_per_ch * spp->nchs;
 
-    spp->pgs_per_pl = spp->pgs_per_blk * spp->blks_per_pl;
+    spp->pgs_per_pl = (int64_t)spp->pgs_per_blk * spp->blks_per_pl;
     spp->pgs_per_lun = spp->pgs_per_pl * spp->pls_per_lun;
     spp->pgs_per_ch = spp->pgs_per_lun * spp->luns_per_ch;
     spp->tt_pgs = spp->pgs_per_ch * spp->nchs;

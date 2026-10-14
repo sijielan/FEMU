@@ -341,7 +341,7 @@ The common ones:
 | `FEMU bbssd: namespace 1 exposes 1024 MiB of the 1024 MiB this geometry has, leaving garbage collection no room; expose at most 960 MiB per namespace (lower devsz_mb, or set op_pcent)` | `devsz_mb` (or the namespace size) does not leave the free lines GC needs. Lower `devsz_mb`, grow the geometry, or set `op_pcent`. |
 | `FEMU bbssd: the geometry has only N lines, fewer than the M garbage collection needs free` | `blks_per_pl` is too small for the reserve that `gc_thres_pcent_high`, `hot_cold_sep`, Streams and log-block mapping add up to. |
 | `FEMU bbssd: nchs must be greater than 0, got 0` | A geometry property is 0 or negative. The same message names any of them. |
-| `FEMU bbssd: the geometry describes N sectors, which exceeds the 2147483647 the FTL can address; ...` | The NAND is too large; reduce one of the geometry properties. |
+| `FEMU bbssd: the geometry describes N pages, which exceeds the 2^40 the FTL can address; ...` | The NAND is too large; reduce one of the geometry properties. |
 | `FEMU bbssd: unknown mapping "x"`, `unknown gc_policy "x"`, `unknown cache_evict "x"; ...` | A misspelled policy name. |
 
 If the host cannot allocate `devsz_mb` (or, with `op_pcent`, the raw NAND)

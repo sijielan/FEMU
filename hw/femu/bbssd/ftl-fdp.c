@@ -1418,7 +1418,8 @@ static uint64_t ssd_stream_write_lpns(FemuCtrl *n, struct ssd *ssd,
     ftl_assert(ruh->curr_ru == ruh->rus[rgid]);
     
     if (end_lpn >= spp->tt_pgs) {
-        ftl_err("write past device geometry: end_lpn=%" PRIu64 " tt_pgs=%d\n",
+        ftl_err("write past device geometry: end_lpn=%" PRIu64 " tt_pgs=%"
+                PRId64 "\n",
                 end_lpn, spp->tt_pgs);
         req->status = NVME_LBA_RANGE | NVME_DNR;
         return 0;
@@ -1922,7 +1923,7 @@ static void ssd_reset_maptbl(struct ssd *ssd)
 {
     struct ssdparams *spp = &ssd->sp;
 
-    for (int i = 0; i < spp->tt_pgs; i++) {
+    for (int64_t i = 0; i < spp->tt_pgs; i++) {
         ssd->maptbl[i].ppa = UNMAPPED_PPA;
         ssd->rmap[i] = INVALID_LPN;
     }
@@ -2007,7 +2008,7 @@ static void ssd_trim_fdp_range(FemuCtrl *n, NvmeRequest *req)
 
         if (end_lpn >= spp->tt_pgs) {
             ftl_err("FDP TRIM: range %d exceeds capacity (end_lpn=%lu "
-                    "tt_pgs=%d)\n", range_idx, end_lpn, spp->tt_pgs);
+                    "tt_pgs=%" PRId64 ")\n", range_idx, end_lpn, spp->tt_pgs);
             continue;
         }
 

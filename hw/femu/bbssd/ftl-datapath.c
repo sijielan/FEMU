@@ -681,7 +681,7 @@ uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
     ssd_lpn_range(ssd, req, req->slba, req->nlb, &start_lpn, &end_lpn);
 
     if (end_lpn >= spp->tt_pgs) {
-        ftl_err("read past device geometry: end_lpn=%"PRIu64" tt_pgs=%d\n",
+        ftl_err("read past device geometry: end_lpn=%"PRIu64" tt_pgs=%"PRId64"\n",
                 end_lpn, ssd->sp.tt_pgs);
         req->status = NVME_LBA_RANGE | NVME_DNR;
         return 0;
@@ -777,7 +777,7 @@ uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
     ssd_lpn_range(ssd, req, req->slba, req->nlb, &start_lpn, &end_lpn);
 
     if (end_lpn >= spp->tt_pgs) {
-        ftl_err("write past device geometry: end_lpn=%"PRIu64" tt_pgs=%d\n",
+        ftl_err("write past device geometry: end_lpn=%"PRIu64" tt_pgs=%"PRId64"\n",
                 end_lpn, ssd->sp.tt_pgs);
         req->status = NVME_LBA_RANGE | NVME_DNR;
         return 0;
@@ -1165,7 +1165,7 @@ uint64_t ssd_trim(struct ssd *ssd, NvmeRequest *req)
 
         // Boundary check
         if (end_lpn >= spp->tt_pgs) {
-            ftl_err("TRIM: Range %d exceeds FTL capacity - end_lpn=%lu, tt_pgs=%d\n", 
+            ftl_err("TRIM: Range %d exceeds FTL capacity - end_lpn=%lu, tt_pgs=%"PRId64"\n",
                    range_idx, end_lpn, spp->tt_pgs);
             total_out_of_bounds++;
             continue;  // Skip this range, continue with others

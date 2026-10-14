@@ -23,7 +23,7 @@
 #include "../inc/pqueue.h"
 
 #define STATE_MAGIC     "FEMUFTL1"
-#define STATE_VERSION   1
+#define STATE_VERSION   2       /* 2: page status in one byte */
 
 enum {
     LINE_NONE, LINE_FREE, LINE_VICTIM, LINE_FULL, LINE_WP, LINE_LOG_WP,
@@ -161,7 +161,7 @@ static bool state_save_ns(FILE *f, struct ssd *ssd, NvmeNamespace *ns)
     StateWp wps[3];
     g_autofree StateLine *lines = g_new0(StateLine, lm->tt_lines);
     g_autofree int32_t *order = g_new(int32_t, lm->tt_lines + 3);
-    g_autofree int32_t *status = NULL;
+    g_autofree uint8_t *status = NULL;
     struct line *line;
     uint64_t k = 0;
     bool ok = true;
@@ -171,7 +171,7 @@ static bool state_save_ns(FILE *f, struct ssd *ssd, NvmeNamespace *ns)
     ok &= state_write(f, ssd->maptbl, sizeof(struct ppa) * ssd->sp.tt_pgs);
     ok &= state_write(f, ssd->rmap, sizeof(uint64_t) * ssd->sp.tt_pgs);
 
-    status = g_new(int32_t, ssd->sp.pgs_per_blk);
+    status = g_new(uint8_t, ssd->sp.pgs_per_blk);
     FOR_EACH_BLOCK(ssd, blk) {
         StateBlock sb = {
             .ipc = blk->ipc, .vpc = blk->vpc, .wp = blk->wp,
@@ -182,7 +182,7 @@ static bool state_save_ns(FILE *f, struct ssd *ssd, NvmeNamespace *ns)
             status[i] = blk->pg[i].status;
         }
         ok &= state_write(f, &sb, sizeof(sb));
-        ok &= state_write(f, status, sizeof(int32_t) * ssd->sp.pgs_per_blk);
+        ok &= state_write(f, status, ssd->sp.pgs_per_blk);
     }
 
     for (int i = 0; i < lm->tt_lines; i++) {
@@ -293,7 +293,7 @@ static int state_load_ns(FILE *f, struct ssd *ssd, NvmeNamespace *ns,
     g_autofree int32_t *free_order = NULL;
     g_autofree int32_t *full_order = NULL;
     g_autofree int32_t *victim_order = NULL;
-    g_autofree int32_t *status = g_new(int32_t, ssd->sp.pgs_per_blk);
+    g_autofree uint8_t *status = g_new(uint8_t, ssd->sp.pgs_per_blk);
     uint64_t nfree, nfull, nvictim;
     bool ok = true;
 
@@ -327,7 +327,7 @@ static int state_load_ns(FILE *f, struct ssd *ssd, NvmeNamespace *ns,
         StateBlock sb;
 
         ok &= state_read(f, &sb, sizeof(sb));
-        ok &= state_read(f, status, sizeof(int32_t) * ssd->sp.pgs_per_blk);
+        ok &= state_read(f, status, ssd->sp.pgs_per_blk);
         if (!ok) {
             break;
         }

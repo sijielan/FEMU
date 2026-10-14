@@ -82,8 +82,9 @@ struct ppa {
     };
 };
 
+/* one byte per page: a PG_* state, kept for every page of the device */
 struct nand_page {
-    int status;
+    uint8_t status;
 };
 
 struct nand_block {
@@ -186,17 +187,20 @@ struct ssdparams {
     int gc_thres_lines_high;
     bool enable_gc_delay;
 
-    /* below are all calculated values */
+    /*
+     * below are all calculated values; the totals that grow with capacity
+     * are 64-bit, so a device past 2^31 sectors or pages is addressable
+     */
     int secs_per_blk; /* # of sectors per block */
-    int secs_per_pl;  /* # of sectors per plane */
-    int secs_per_lun; /* # of sectors per LUN */
-    int secs_per_ch;  /* # of sectors per channel */
-    int tt_secs;      /* # of sectors in the SSD */
+    int64_t secs_per_pl;  /* # of sectors per plane */
+    int64_t secs_per_lun; /* # of sectors per LUN */
+    int64_t secs_per_ch;  /* # of sectors per channel */
+    int64_t tt_secs;      /* # of sectors in the SSD */
 
-    int pgs_per_pl;   /* # of pages per plane */
-    int pgs_per_lun;  /* # of pages per LUN (Die) */
-    int pgs_per_ch;   /* # of pages per channel */
-    int tt_pgs;       /* total # of pages in the SSD */
+    int64_t pgs_per_pl;   /* # of pages per plane */
+    int64_t pgs_per_lun;  /* # of pages per LUN (Die) */
+    int64_t pgs_per_ch;   /* # of pages per channel */
+    int64_t tt_pgs;       /* total # of pages in the SSD */
 
     int blks_per_lun; /* # of blocks per LUN */
     int blks_per_ch;  /* # of blocks per channel */
