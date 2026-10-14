@@ -2277,7 +2277,7 @@ int nvme_ns_create(FemuCtrl *n, uint32_t nsid, uint64_t nsze, uint8_t flbas,
         error_setg(errp, "injected namespace initialization failure");
         goto fail;
     }
-    memset((uint8_t *)n->mbe->logical_space + offset, 0, length);
+    backend_zero_range(n->mbe, offset, length);
     if (nvme_ns_mgmt_supported(n)) {
         stq_le_p(ns->id_ns.nvmcap, length);
     }
@@ -2623,6 +2623,52 @@ static bool femu_check_pd_props(FemuCtrl *n, Error **errp)
  * cxl_ssd link or a shared namespace uses an FTL another device made. The
  * namespace modes are checked in nvme_init_namespaces().
  */
+/*
+ * The mbe_* properties. Only a sparse or file backend reads them, so setting
+ * one for another type fails rather than doing nothing; dram with none set
+ * is the backend FEMU always had.
+ */
+static bool femu_check_mbe_props(FemuCtrl *n, Error **errp)
+{
+    FemuMbeConfig *cfg = &n->mbe_cfg;
+
+    if (femu_mbe_parse_type(n->mbe_type, &cfg->type, errp)) {
+        return false;
+    }
+    cfg->file = n->mbe_file;
+    cfg->thp = n->mbe_thp;
+    cfg->lock = n->mbe_lock;
+    cfg->pin_meta = n->mbe_pin_meta;
+    if (cfg->type == FEMU_MBE_DRAM) {
+        if (n->mbe_file || n->mbe_thp || n->mbe_lock || !n->mbe_pin_meta) {
+            error_setg(errp, "femu: mbe_file, mbe_thp, mbe_lock and "
+                       "mbe_pin_meta need mbe_type=sparse or file");
+            return false;
+        }
+        return true;
+    }
+    if (n->cxl_dev) {
+        error_setg(errp, "femu: mbe_type=%s cannot be used with cxl_ssd, "
+                   "which serves the CXL device's own memory", n->mbe_type);
+        return false;
+    }
+    if ((cfg->type == FEMU_MBE_FILE) != !!n->mbe_file) {
+        error_setg(errp, "femu: mbe_file is %s with mbe_type=%s",
+                   n->mbe_file ? "not used" : "required", n->mbe_type);
+        return false;
+    }
+    if (cfg->type == FEMU_MBE_FILE && (n->mbe_thp || n->mbe_lock)) {
+        error_setg(errp, "femu: mbe_thp and mbe_lock need mbe_type=sparse");
+        return false;
+    }
+    if (!n->mbe_pin_meta) {
+        warn_report("femu: mbe_pin_meta=off: the host may page out FTL "
+                    "metadata and FEMU threads, and the faults show up as "
+                    "late completions");
+    }
+    return true;
+}
+
 static bool femu_check_onfi_props(FemuCtrl *n, Error **errp)
 {
     const BbCtrlParams *bp = &n->bb_params;
@@ -2793,6 +2839,9 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
     if (!femu_check_onfi_props(n, errp)) {
         return;
     }
+    if (!femu_check_mbe_props(n, errp)) {
+        return;
+    }
 
     /* Format and Sanitize would rewrite the whole medium under its cache. */
     if (n->cxl_dev) {
@@ -2820,13 +2869,20 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
     }
 
     if (nvme_ns_shared(n) && n->subsys->storage) {
+        if (n->mbe_cfg.type != n->subsys->storage->mbe->type) {
+            error_setg(errp, "femu: mbe_type must match the controller that "
+                       "created the shared namespaces");
+            return;
+        }
         n->mbe = n->subsys->storage->mbe;
         n->shared_storage = true;
     } else if (n->cxl_dev) {
         /* prepare() lent the medium's backend; the pollers bring its locks */
         backend_init_range_locks(n->mbe);
     } else {
-        init_dram_backend(&n->mbe, bs_size);
+        if (init_dram_backend(&n->mbe, bs_size, &n->mbe_cfg, errp)) {
+            return;
+        }
         n->mbe->femu_mode = n->femu_mode;
     }
 
@@ -3251,6 +3307,11 @@ static const Property femu_props[] = {
     DEFINE_PROP_STRING("serial", FemuCtrl, serial),
     DEFINE_PROP_STRING("pel_file", FemuCtrl, pel_file),
     DEFINE_PROP_UINT32("devsz_mb", FemuCtrl, memsz, 1024), /* in MB */
+    DEFINE_PROP_STRING("mbe_type", FemuCtrl, mbe_type),
+    DEFINE_PROP_STRING("mbe_file", FemuCtrl, mbe_file),
+    DEFINE_PROP_BOOL("mbe_thp", FemuCtrl, mbe_thp, false),
+    DEFINE_PROP_BOOL("mbe_lock", FemuCtrl, mbe_lock, false),
+    DEFINE_PROP_BOOL("mbe_pin_meta", FemuCtrl, mbe_pin_meta, true),
     DEFINE_PROP_UINT32("namespaces", FemuCtrl, num_namespaces, 1),
     DEFINE_PROP_UINT32("queues", FemuCtrl, nr_io_queues, 8),
     DEFINE_PROP_UINT32("entries", FemuCtrl, max_q_ents, 0x7ff),
@@ -3784,10 +3845,20 @@ static void femu_test_range_waits_get(Object *obj, Visitor *v,
     visit_type_uint64(v, name, &value, errp);
 }
 
+static void femu_mbe_resident_get(Object *obj, Visitor *v, const char *name,
+                                  void *opaque, Error **errp)
+{
+    uint64_t value = backend_resident_bytes(FEMU(obj)->mbe);
+
+    visit_type_uint64(v, name, &value, errp);
+}
+
 static void femu_instance_init(Object *obj)
 {
     object_property_add_bool(obj, "simulate-power-loss", NULL,
                              femu_simulate_power_loss);
+    object_property_add(obj, "mbe-resident", "uint64", femu_mbe_resident_get,
+                        NULL, NULL, NULL);
     femu_ctrl_describe_runtime(obj);
     if (qtest_enabled()) {
         object_property_add_bool(obj, "x-oc12-clock", NULL,

@@ -69,6 +69,27 @@ static const FemuPropDesc femu_ctrl_descs[] = {
       "Size of the host memory backend in MiB, split across namespaces "
       "unless namespace_sizes is set; bbssd with op_pcent sizes from the "
       "NAND geometry instead" },
+    { "mbe_type",
+      "How the memory backend holds data: dram (default) allocates and pins "
+      "all of it at start; sparse takes host memory only for blocks written "
+      "and returns it on deallocate; file maps mbe_file so the host page "
+      "cache holds the data" },
+    { "mbe_file",
+      "Host file a mbe_type=file backend maps, created or extended with a "
+      "hole to the backend size; its file system must have room for the "
+      "whole backend, and a larger file fails realize" },
+    { "mbe_thp",
+      "mbe_type=sparse: let the host back the data with transparent huge "
+      "pages, which takes 2 MiB per scattered 4 KiB write; off by default" },
+    { "mbe_lock",
+      "mbe_type=sparse: keep each page of data resident once written, so "
+      "only blocks never written or deallocated cost no memory; needs "
+      "RLIMIT_MEMLOCK unlimited" },
+    { "mbe_pin_meta",
+      "mbe_type=sparse or file: pin all process memory other than the "
+      "backend data as it is touched (mlockall), so FTL metadata and FEMU "
+      "threads never page out; needs RLIMIT_MEMLOCK unlimited, off only for "
+      "unprivileged runs" },
     { "namespaces",
       "Number of namespaces created at boot, 1 to 256; OCSSD and FDP "
       "support only 1" },
@@ -713,6 +734,9 @@ static const FemuPropDesc femu_ctrl_runtime_descs[] = {
       "Write-only: setting true on a realized controller with power_loss=on "
       "drops the write buffer and resets the controller as a power cut "
       "would" },
+    { "mbe-resident",
+      "Read-only: bytes of the memory backend now in host memory; for "
+      "mbe_type=file, the pages of mbe_file in the page cache" },
     { NULL, NULL }
 };
 

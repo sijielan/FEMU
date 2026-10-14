@@ -30,6 +30,14 @@ DEVICES = [
                 ],
             },
             {
+                "title": "Memory backend",
+                "kind": "static",
+                "props": [
+                    "mbe_type", "mbe_file", "mbe_thp", "mbe_lock",
+                    "mbe_pin_meta",
+                ],
+            },
+            {
                 "title": "Queues, pollers and interrupts",
                 "kind": "static",
                 "props": [
@@ -170,6 +178,13 @@ DEVICES = [
                 "kind": "runtime",
                 "props": [
                     "simulate-power-loss",
+                ],
+            },
+            {
+                "title": "Memory backend usage",
+                "kind": "runtime",
+                "props": [
+                    "mbe-resident",
                 ],
             },
         ],

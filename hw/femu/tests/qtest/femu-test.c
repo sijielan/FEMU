@@ -30948,6 +30948,138 @@ static void femu_test_compare_verify_zns(void *obj, void *data,
     femu_disable(&c);
 }
 
+static uint64_t femu_mbe_resident(QTestState *qts)
+{
+    QDict *rsp = qtest_qmp(qts, "{'execute':'qom-get','arguments':{"
+                           "'path':'/machine/peripheral/mbe',"
+                           "'property':'mbe-resident'}}");
+    uint64_t value = qdict_get_int(rsp, "return");
+
+    qobject_unref(rsp);
+    return value;
+}
+
+/*
+ * A sparse or file backend takes host memory only for the blocks written, and
+ * a deallocate gives it back: the blocks read as zeros again and their pages
+ * leave mbe-resident. A file backend keeps the data across a restart, and
+ * the deallocate punches it out of the file.
+ */
+static void femu_test_mbe_lazy(void *obj, void *data, QGuestAllocator *unused)
+{
+    const bool file = data != NULL;
+    const int runs = file ? 2 : 1;
+    const uint32_t pages = 256;
+    g_autofree char *dir = g_dir_make_tmp("femu-mbe-XXXXXX", NULL);
+    g_autofree char *path = g_build_filename(dir, "backend", NULL);
+    g_autofree char *type = file ? g_strdup_printf("file,mbe_file=%s", path)
+                                 : g_strdup("sparse");
+    struct stat st;
+    int run;
+
+    for (run = 1; run <= runs; run++) {
+        QOSState *qs = qtest_pc_boot(
+            "-machine pc -nodefaults -device femu,id=mbe,addr=5,devsz_mb=64,"
+            "femu_mode=2,mbe_type=%s,mbe_pin_meta=off", type);
+        QTestState *qts = qs->qts;
+        QPCIDevice *pdev = qpci_device_find(qs->pcibus, QPCI_DEVFN(5, 0));
+        FemuCtrlState c = { 0 };
+        uint64_t buf = guest_alloc(&qs->alloc, FEMU_DATA_SIZE);
+        uint8_t got[FEMU_DATA_SIZE];
+        uint64_t stride;
+        uint32_t i, j;
+
+        femu_enable(&c, pdev, &qs->alloc);
+        femu_create_io_queues(&c);
+        stride = FEMU_DATA_SIZE / c.lba_size;
+        if (run == 1) {
+            g_assert_cmpuint(femu_mbe_resident(qts), ==, 0);
+            for (i = 0; i < pages; i++) {
+                qtest_memset(qts, buf, i + 1, FEMU_DATA_SIZE);
+                g_assert_cmphex(femu_rw(&c, NVME_CMD_WRITE, i * stride, buf),
+                                ==, NVME_SUCCESS);
+            }
+            g_assert_cmpuint(femu_mbe_resident(qts), >=,
+                             pages * FEMU_DATA_SIZE);
+        }
+        for (i = 0; i < pages; i += 17) {
+            g_assert_cmphex(femu_rw(&c, NVME_CMD_READ, i * stride, buf), ==,
+                            NVME_SUCCESS);
+            qtest_memread(qts, buf, got, sizeof(got));
+            for (j = 0; j < sizeof(got); j++) {
+                g_assert_cmpint(got[j], ==, (uint8_t)(i + 1));
+            }
+        }
+        if (run == runs) {
+            g_assert_cmphex(femu_dealloc_pages(&c, 0, pages, buf), ==,
+                            NVME_SUCCESS);
+            /*
+             * Checked before a read maps a zero page back in. The reads of a
+             * file backend also read ahead past the range, into the hole.
+             */
+            if (file) {
+                g_assert_cmpuint(femu_mbe_resident(qts), <,
+                                 pages * FEMU_DATA_SIZE / 2);
+            } else {
+                g_assert_cmpuint(femu_mbe_resident(qts), ==, 0);
+            }
+            qtest_memset(qts, buf, 0xa5, FEMU_DATA_SIZE);
+            g_assert_cmphex(femu_rw(&c, NVME_CMD_READ, 5 * stride, buf), ==,
+                            NVME_SUCCESS);
+            qtest_memread(qts, buf, got, sizeof(got));
+            for (j = 0; j < sizeof(got); j++) {
+                g_assert_cmpint(got[j], ==, 0);
+            }
+        }
+        femu_disable(&c);
+        guest_free(&qs->alloc, buf);
+        g_free(pdev);
+        qtest_pc_shutdown(qs);
+    }
+    if (file) {
+        g_assert_cmpint(stat(path, &st), ==, 0);
+        g_assert_cmpint(st.st_size, ==, 64 << 20);
+        g_assert_cmpint(st.st_blocks * 512, <, pages * FEMU_DATA_SIZE);
+        unlink(path);
+    }
+    rmdir(dir);
+}
+
+/* mbe_* settings a backend type does not read fail realize */
+static void femu_test_mbe_refused(void *obj, void *data,
+                                  QGuestAllocator *alloc)
+{
+    QFemu *femu = obj;
+    QTestState *qts = femu->dev.bus->qts;
+    static const char *const opts[][2] = {
+        { "'mbe_type':'flash'", "mbe_type=flash is not one of" },
+        { "'mbe_thp':true", "need mbe_type=sparse or file" },
+        { "'mbe_pin_meta':false", "need mbe_type=sparse or file" },
+        { "'mbe_file':'/nonexistent/x'", "need mbe_type=sparse or file" },
+        { "'mbe_type':'file','mbe_pin_meta':false", "mbe_file is required" },
+        { "'mbe_type':'sparse','mbe_pin_meta':false,"
+          "'mbe_file':'/nonexistent/x'", "mbe_file is not used" },
+        { "'mbe_type':'file','mbe_pin_meta':false,'mbe_lock':true,"
+          "'mbe_file':'/nonexistent/x'", "need mbe_type=sparse" },
+        { "'mbe_type':'file','mbe_pin_meta':false,"
+          "'mbe_file':'/nonexistent/x'", "/nonexistent/x" },
+    };
+    QDict *rsp;
+
+    for (int i = 0; i < ARRAY_SIZE(opts); i++) {
+        g_autofree char *cmd = g_strdup_printf(
+            "{'execute':'device_add','arguments':{'driver':'femu',"
+            "'id':'mbe-bad','addr':'5','devsz_mb':8,'femu_mode':2,%s}}",
+            opts[i][0]);
+
+        rsp = qtest_qmp(qts, "%p", qobject_from_json(cmd, NULL));
+        g_assert_true(qdict_haskey(rsp, "error"));
+        g_assert_nonnull(strstr(qdict_get_str(qdict_get_qdict(rsp, "error"),
+                                              "desc"), opts[i][1]));
+        qobject_unref(rsp);
+    }
+}
+
 static void femu_register_nodes(void)
 {
     QOSGraphEdgeOptions opts = {
@@ -31950,6 +32082,10 @@ static void femu_register_nodes(void)
         .edge.extra_device_opts = "ns_mgmt=on"
     });
     qos_add_test("pel-file-quit", "femu", femu_test_pel_file_quit, NULL);
+    qos_add_test("mbe-sparse", "femu", femu_test_mbe_lazy, NULL);
+    qos_add_test("mbe-file", "femu", femu_test_mbe_lazy,
+                 &(QOSGraphTestOptions) { .arg = (void *)"file" });
+    qos_add_test("mbe-refused", "femu", femu_test_mbe_refused, NULL);
     qos_add_test("pel-file-quit-media", "femu", femu_test_pel_file_quit,
                  &(QOSGraphTestOptions) { .arg = GINT_TO_POINTER(1) });
     qos_add_test("pel-file-invalid", "femu", femu_test_pel_file_invalid, NULL);

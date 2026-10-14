@@ -2957,7 +2957,7 @@ static uint16_t nvme_sanitize(FemuCtrl *n, NvmeCmd *cmd)
     }
     if (n->ns_mgmt && n->mbe && n->mbe->logical_space) {
         /* The pool includes deleted extents, but excludes spare capacity. */
-        memset(n->mbe->logical_space, 0, n->namespace_pool_size);
+        backend_zero_range(n->mbe, 0, n->namespace_pool_size);
     }
     for (int i = 0; i < n->namespace_limit; i++) {
         NvmeNamespace *ns = &n->namespaces[i];
@@ -2966,8 +2966,7 @@ static uint16_t nvme_sanitize(FemuCtrl *n, NvmeCmd *cmd)
             continue;
         }
         if (!n->ns_mgmt && n->mbe && n->mbe->logical_space) {
-            memset(n->mbe->logical_space + ns->backend_offset, 0,
-                   ns->extent_size);
+            backend_zero_range(n->mbe, ns->backend_offset, ns->extent_size);
         }
         bitmap_zero(ns->util, ns->ns_blks);
         bitmap_zero(ns->uncorrectable, ns->ns_blks);
@@ -3401,8 +3400,7 @@ static uint16_t nvme_format_namespace(NvmeNamespace *ns, uint8_t lba_idx,
      * deallocated-block error disabled reads zeros rather than stale data.
      */
     if (n->mbe && n->mbe->logical_space) {
-        memset((uint8_t *)n->mbe->logical_space + ns->backend_offset, 0,
-               ns->size);
+        backend_zero_range(n->mbe, ns->backend_offset, ns->size);
     }
     nvme_streams_release(ns, false);
 

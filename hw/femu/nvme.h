@@ -2412,6 +2412,12 @@ typedef struct FemuCtrl {
     uint8_t         femu_mode;
     uint8_t         lver; /* Coperd: OCSSD version, 0x1 -> OC1.2, 0x2 -> OC2.0 */
     uint32_t        memsz;
+    char            *mbe_type;  /* how the backend holds data, see FemuMbeType */
+    char            *mbe_file;
+    bool            mbe_thp;
+    bool            mbe_lock;
+    bool            mbe_pin_meta;
+    FemuMbeConfig   mbe_cfg;    /* the above, parsed at realize */
     uint32_t        read_cache_mb; /* bbssd DRAM read cache size (0 = off) */
     uint32_t        mapping_cache_mb; /* bbssd DFTL translation cache size (0 = off) */
     uint8_t         nand_cell_type; /* bbssd NAND cell type: 0=off(flat), 1 SLC..4 QLC */

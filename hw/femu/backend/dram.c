@@ -1,5 +1,8 @@
 #include <sys/syscall.h>
+#include <sys/resource.h>
+#include <sys/statvfs.h>
 #include "../nvme.h"
+#include "qemu/madvise.h"
 
 /* Coperd: FEMU Memory Backend (mbe) for emulated SSD */
 
@@ -52,31 +55,323 @@ static void mbe_numa_bind(void *addr, int64_t len)
     }
 }
 
-int init_dram_backend(SsdDramBackend **mbe, int64_t nbytes)
+int femu_mbe_parse_type(const char *name, FemuMbeType *type, Error **errp)
 {
-    SsdDramBackend *b = *mbe = g_malloc0(sizeof(SsdDramBackend));
+    if (!name || !strcmp(name, "dram")) {
+        *type = FEMU_MBE_DRAM;
+    } else if (!strcmp(name, "sparse")) {
+        *type = FEMU_MBE_SPARSE;
+    } else if (!strcmp(name, "file")) {
+        *type = FEMU_MBE_FILE;
+    } else {
+        error_setg(errp, "femu: mbe_type=%s is not one of dram, sparse, file",
+                   name);
+        return -1;
+    }
+    return 0;
+}
 
-    b->size = nbytes;
-    b->logical_space = g_malloc0(nbytes);
+/* CAP_IPC_LOCK lifts RLIMIT_MEMLOCK; read it without a libcap dependency */
+static bool mbe_has_ipc_lock(void)
+{
+    g_autofree char *status = NULL;
+    const char *cap, *end;
+    uint64_t eff;
 
-    /* bind to the requested NUMA node before mlock faults the pages in */
-    mbe_numa_bind(b->logical_space, nbytes);
+    if (!g_file_get_contents("/proc/self/status", &status, NULL, NULL)) {
+        return false;
+    }
+    cap = strstr(status, "\nCapEff:");
+    if (!cap || qemu_strtou64(cap + strlen("\nCapEff:"), &end, 16, &eff)) {
+        return false;
+    }
+    return eff & (1ull << 14 /* CAP_IPC_LOCK */);
+}
 
-    /*
-     * Pinning keeps page faults out of the emulated latency, but it needs
-     * RLIMIT_MEMLOCK to cover the backend, which an unprivileged run rarely
-     * has. Say what that costs and carry on rather than refuse to start: the
-     * device works either way, only its timing is then subject to faults.
-     */
-    if (mlock(b->logical_space, nbytes) == -1) {
-        femu_err("cannot pin the %" PRId64 " MiB memory backend (%s); "
-                 "latencies may jitter until RLIMIT_MEMLOCK allows it\n",
-                 nbytes / MiB, strerror(errno));
+/* Locking more than the limit fails, now or at some later allocation. */
+static int mbe_check_memlock(const char *what, Error **errp)
+{
+    struct rlimit rl;
+
+    if (getrlimit(RLIMIT_MEMLOCK, &rl) || rl.rlim_cur == RLIM_INFINITY ||
+        mbe_has_ipc_lock()) {
+        return 0;
+    }
+    error_setg(errp, "femu: %s needs RLIMIT_MEMLOCK unlimited (it is %" PRIu64
+               " bytes) or CAP_IPC_LOCK; run as root or under ulimit -l "
+               "unlimited", what, (uint64_t)rl.rlim_cur);
+    return -1;
+}
+
+/*
+ * When the host may reclaim the data of a sparse or file backend, it may
+ * reclaim anything else in the process too, and an FTL thread or poller that
+ * faults on its metadata, a ring or its stack stalls with the emulated clock
+ * running. So pin every page of the process, now and later, and leave only
+ * the backends' data reclaimable: each is unlocked as it is mapped, after
+ * this. MCL_ONFAULT pins a page when it is first touched, not at once, which
+ * would fault in all of guest memory and every mapping made later. Once per
+ * process, since a second MCL_CURRENT would pin the data mapped since.
+ */
+static int mbe_pin_process(Error **errp)
+{
+    static bool pinned;
+
+    if (pinned) {
+        return 0;
+    }
+    if (mbe_check_memlock("mbe_pin_meta", errp)) {
+        return -1;
+    }
+    if (mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT)) {
+        error_setg_errno(errp, errno, "femu: mbe_pin_meta: mlockall failed");
+        return -1;
+    }
+    pinned = true;
+    return 0;
+}
+
+/*
+ * Map the data with none of it resident. The mapping starts PROT_NONE, which
+ * neither mlockall(MCL_FUTURE) nor -overcommit mem-lock=on populates, is
+ * unlocked, and only then made accessible, so a page takes host memory when
+ * the guest first writes it and the host may reclaim it afterwards.
+ */
+static void *mbe_map(int64_t len, int fd, Error **errp)
+{
+    int flags = fd < 0 ? MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
+                       : MAP_SHARED;
+    void *p = mmap(NULL, len, PROT_NONE, flags, fd, 0);
+
+    if (p == MAP_FAILED) {
+        error_setg_errno(errp, errno, "femu: cannot map the %" PRId64
+                         " MiB memory backend", len / MiB);
+        return NULL;
+    }
+    munlock(p, len);
+    if (mprotect(p, len, PROT_READ | PROT_WRITE)) {
+        error_setg_errno(errp, errno, "femu: cannot map the %" PRId64
+                         " MiB memory backend", len / MiB);
+        munmap(p, len);
+        return NULL;
+    }
+    return p;
+}
+
+/*
+ * Open the file a file backend maps, sized to the backend. A shorter file is
+ * extended with a hole; a longer one is refused rather than cut. The file
+ * system has to have room for the blocks not yet allocated: a write fault on
+ * a hole it cannot fill raises SIGBUS and takes QEMU down mid-run.
+ */
+static int mbe_open_file(const char *path, int64_t len, Error **errp)
+{
+    struct statvfs vfs;
+    struct stat st;
+    uint64_t need;
+    int fd;
+
+    fd = qemu_create(path, O_RDWR, 0644, errp);
+    if (fd < 0) {
+        return -1;
+    }
+    if (fstat(fd, &st)) {
+        error_setg_errno(errp, errno, "femu: mbe_file %s", path);
+        goto fail;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        error_setg(errp, "femu: mbe_file %s is not a regular file", path);
+        goto fail;
+    }
+    if (st.st_size > len) {
+        error_setg(errp, "femu: mbe_file %s holds %" PRId64 " bytes, more "
+                   "than the %" PRId64 " byte backend; remove or truncate it",
+                   path, (int64_t)st.st_size, len);
+        goto fail;
+    }
+    need = len - MIN((uint64_t)st.st_blocks * 512, (uint64_t)len);
+    if (fstatvfs(fd, &vfs)) {
+        error_setg_errno(errp, errno, "femu: mbe_file %s", path);
+        goto fail;
+    }
+    if ((uint64_t)vfs.f_bavail * vfs.f_frsize < need) {
+        error_setg(errp, "femu: mbe_file %s needs %" PRIu64 " MiB more free "
+                   "space than its file system has (%" PRIu64 " MiB)", path,
+                   need / MiB, (uint64_t)vfs.f_bavail * vfs.f_frsize / MiB);
+        goto fail;
+    }
+    if (st.st_size < len && ftruncate(fd, len)) {
+        error_setg_errno(errp, errno, "femu: cannot size mbe_file %s", path);
+        goto fail;
+    }
+    return fd;
+
+fail:
+    qemu_close(fd);
+    return -1;
+}
+
+int init_dram_backend(SsdDramBackend **mbe, int64_t nbytes,
+                      const FemuMbeConfig *cfg, Error **errp)
+{
+    SsdDramBackend *b;
+    int fd = -1;
+
+    if (cfg->type == FEMU_MBE_DRAM) {
+        b = *mbe = g_malloc0(sizeof(SsdDramBackend));
+        b->size = nbytes;
+        b->fd = -1;
+        b->logical_space = g_malloc0(nbytes);
+
+        /* bind to the requested NUMA node before mlock faults the pages in */
+        mbe_numa_bind(b->logical_space, nbytes);
+
+        /*
+         * Pinning keeps page faults out of the emulated latency, but it needs
+         * RLIMIT_MEMLOCK to cover the backend, which an unprivileged run
+         * rarely has. Say what that costs and carry on rather than refuse to
+         * start: the device works either way, only its timing is then subject
+         * to faults.
+         */
+        if (mlock(b->logical_space, nbytes) == -1) {
+            femu_err("cannot pin the %" PRId64 " MiB memory backend (%s); "
+                     "latencies may jitter until RLIMIT_MEMLOCK allows it\n",
+                     nbytes / MiB, strerror(errno));
+        }
+
+        backend_init_range_locks(b);
+        return 0;
     }
 
+    if (cfg->pin_meta && mbe_pin_process(errp)) {
+        return -1;
+    }
+    if (cfg->lock && mbe_check_memlock("mbe_lock", errp)) {
+        return -1;
+    }
+    if (cfg->type == FEMU_MBE_FILE) {
+        fd = mbe_open_file(cfg->file, nbytes, errp);
+        if (fd < 0) {
+            return -1;
+        }
+    }
+
+    b = g_malloc0(sizeof(SsdDramBackend));
+    b->size = nbytes;
+    b->type = cfg->type;
+    b->fd = fd;
+    b->logical_space = mbe_map(nbytes, fd, errp);
+    if (!b->logical_space) {
+        if (fd >= 0) {
+            qemu_close(fd);
+        }
+        g_free(b);
+        return -1;
+    }
+
+    if (cfg->type == FEMU_MBE_SPARSE) {
+        /*
+         * A huge page takes 2 MiB for a 4 KiB write, and a deallocate of part
+         * of one splits it rather than frees it, so the default keeps the
+         * backend to base pages whatever the host's THP setting.
+         */
+        qemu_madvise(b->logical_space, nbytes,
+                     cfg->thp ? QEMU_MADV_HUGEPAGE : QEMU_MADV_NOHUGEPAGE);
+        mbe_numa_bind(b->logical_space, nbytes);
+        if (cfg->lock) {
+            if (mlock2(b->logical_space, nbytes, MLOCK_ONFAULT)) {
+                error_setg_errno(errp, errno, "femu: mbe_lock: mlock2 failed");
+                munmap(b->logical_space, nbytes);
+                g_free(b);
+                return -1;
+            }
+            b->locked = true;
+        }
+    }
+
+    femu_log("backend: %" PRId64 " MiB %s backend%s%s\n", nbytes / MiB,
+             cfg->type == FEMU_MBE_FILE ? "file" : "sparse",
+             cfg->type == FEMU_MBE_FILE ? " on " : "",
+             cfg->type == FEMU_MBE_FILE ? cfg->file : "");
+    *mbe = b;
     backend_init_range_locks(b);
 
     return 0;
+}
+
+/*
+ * Zero [off, off + len) of the backing store. A sparse backend gives the
+ * whole pages back to the host, which then read as zero, and a file backend
+ * punches them out of the file, so a deallocate takes memory away rather
+ * than faulting in every page it clears. Bytes that cannot be dropped are
+ * written. The caller keeps other accesses to the range out.
+ */
+void backend_zero_range(SsdDramBackend *b, uint64_t off, uint64_t len)
+{
+    uint8_t *base = b->logical_space;
+    uint64_t pgsz = qemu_real_host_page_size();
+    uint64_t start = ROUND_UP(off, pgsz);
+    uint64_t end = QEMU_ALIGN_DOWN(off + len, pgsz);
+
+    if (!len) {
+        return;
+    }
+    if (b->type == FEMU_MBE_FILE &&
+        !fallocate(b->fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, off,
+                   len)) {
+        return;
+    }
+    if (b->type == FEMU_MBE_SPARSE && start < end) {
+        bool dropped;
+
+        /* MADV_DONTNEED refuses locked pages */
+        if (b->locked) {
+            munlock(base + start, end - start);
+        }
+        dropped = !qemu_madvise(base + start, end - start,
+                                QEMU_MADV_DONTNEED);
+        if (b->locked) {
+            mlock2(base + start, end - start, MLOCK_ONFAULT);
+        }
+        if (dropped) {
+            memset(base + off, 0, start - off);
+            memset(base + end, 0, off + len - end);
+            return;
+        }
+    }
+    memset(base + off, 0, len);
+}
+
+/*
+ * Bytes of the backing store in host memory: for a file backend, the pages
+ * of the file in the page cache. Walked in 1 GiB steps to keep the mincore
+ * vector small.
+ */
+uint64_t backend_resident_bytes(SsdDramBackend *b)
+{
+    uint64_t pgsz = qemu_real_host_page_size();
+    uintptr_t start, end, addr;
+    uint64_t resident = 0;
+    g_autofree unsigned char *vec = NULL;
+
+    if (!b || !b->logical_space || !b->size) {
+        return 0;
+    }
+    start = QEMU_ALIGN_DOWN((uintptr_t)b->logical_space, pgsz);
+    end = ROUND_UP((uintptr_t)b->logical_space + b->size, pgsz);
+    vec = g_malloc(GiB / pgsz);
+    for (addr = start; addr < end; addr += GiB) {
+        uint64_t len = MIN(GiB, end - addr);
+        uint64_t n = len / pgsz;
+
+        if (mincore((void *)addr, len, vec)) {
+            break;
+        }
+        for (uint64_t i = 0; i < n; i++) {
+            resident += vec[i] & 1;
+        }
+    }
+    return resident * pgsz;
 }
 
 /* A backend another device lends takes its locks from the borrower. */
@@ -108,9 +403,14 @@ void free_dram_backend(SsdDramBackend *b)
     if (!b) {
         return;
     }
-    if (b->logical_space) {
+    if (b->logical_space && b->type != FEMU_MBE_DRAM) {
+        munmap(b->logical_space, b->size);
+    } else if (b->logical_space) {
         munlock(b->logical_space, b->size);
         g_free(b->logical_space);
+    }
+    if (b->type == FEMU_MBE_FILE && b->fd >= 0) {
+        qemu_close(b->fd);
     }
     backend_free_range_locks(b);
     g_free(b);

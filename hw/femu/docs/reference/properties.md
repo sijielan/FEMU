@@ -22,7 +22,7 @@ Devices:
 
 ## `femu`: NVMe controller
 
-`-device femu` has 186 properties of its own and 1 QOM property listed in [runtime-properties.md](runtime-properties.md).
+`-device femu` has 191 properties of its own and 2 QOM properties listed in [runtime-properties.md](runtime-properties.md).
 
 ### Mode, capacity and namespaces
 
@@ -38,6 +38,16 @@ Devices:
 | `cxl_ssd` | `link<femu-cxl-ssd>` | unset | ID of a femu-cxl-ssd, listed before this controller, whose memory and FTL this bbssd controller serves as its one namespace |
 | `pel_file` | `str` | unset | Host file that keeps the Persistent Event Log and power cycle count across runs, created if missing; a corrupt or incompatible file fails realize |
 | `serial` | `str` | unset | No effect, kept for compatibility; Identify Controller reports a serial number FEMU generates. Setting it warns at realize |
+
+### Memory backend
+
+| Property | Type | Default | Description |
+| --- | --- | --- | --- |
+| `mbe_type` | `str` | unset | How the memory backend holds data: dram (default) allocates and pins all of it at start; sparse takes host memory only for blocks written and returns it on deallocate; file maps mbe_file so the host page cache holds the data |
+| `mbe_file` | `str` | unset | Host file a mbe_type=file backend maps, created or extended with a hole to the backend size; its file system must have room for the whole backend, and a larger file fails realize |
+| `mbe_thp` | `bool` | `off` | mbe_type=sparse: let the host back the data with transparent huge pages, which takes 2 MiB per scattered 4 KiB write; off by default |
+| `mbe_lock` | `bool` | `off` | mbe_type=sparse: keep each page of data resident once written, so only blocks never written or deallocated cost no memory; needs RLIMIT_MEMLOCK unlimited |
+| `mbe_pin_meta` | `bool` | `on` | mbe_type=sparse or file: pin all process memory other than the backend data as it is touched (mlockall), so FTL metadata and FEMU threads never page out; needs RLIMIT_MEMLOCK unlimited, off only for unprivileged runs |
 
 ### Queues, pollers and interrupts
 

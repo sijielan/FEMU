@@ -25,6 +25,12 @@ or in the HMP monitor with `qom-get` and `qom-set`. Event counters are cleared b
 | --- | --- | --- |
 | `simulate-power-loss` | `bool` | Write-only: setting true on a realized controller with power_loss=on drops the write buffer and resets the controller as a power cut would |
 
+### Memory backend usage
+
+| Property | Type | Description |
+| --- | --- | --- |
+| `mbe-resident` | `uint64` | Read-only: bytes of the memory backend now in host memory; for mbe_type=file, the pages of mbe_file in the page cache |
+
 ## `femu-cxl-ssd`: CXL Type-3 SSD
 
 ### Cache tunables (also accepted on -device)
