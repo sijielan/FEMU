@@ -383,6 +383,7 @@ after the time the model gives it.
 | `past-due` | the model's due time, to the posted entry |
 | `copy-read` | the copy of a read's data out of the memory backend, inside `submit` |
 | `copy-write` | the copy of a write's data into the memory backend, inside `submit` |
+| `fetch-wait` | the poller's read of the queue tail, to the fetch of the command in that sweep; not in `total` |
 
 For a command that goes through the FTL ring, the first four stages add up
 to the total time. A large `past-due` means that completions land later than the
@@ -395,6 +396,15 @@ The two copy stages show where the backend's data came from. With
 zswap takes a few microseconds and one that reads the host disk tens of
 microseconds or more, so the buckets split the reads by tier; `mbe-swapped`,
 `mbe-zswap-pool` and `mbe-zswapped` give the backend's share of each.
+With `async_copy` the copy runs on a copy thread and these stages time it
+there; a completion that falls due before its copy ends waits for it and
+counts in `copy-waits`.
+
+`fetch-wait` shows commands waiting for the poller: a sweep reads the
+queue tail once and then takes the commands one by one, copying each
+one's data before the next unless `async_copy` is on, so a slow copy makes
+the commands behind it wait. Their own latency starts at the fetch and
+does not show it.
 
 Each stage has `count`, `sum-ns`, `max-ns` and 40 `buckets`. Bucket i holds
 the commands that took 2^i to 2^(i+1) - 1 ns. Bucket 0 also holds 0 ns,

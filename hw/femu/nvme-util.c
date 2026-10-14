@@ -133,6 +133,10 @@ static bool nvme_pause_controller(FemuCtrl *n)
                 }
             }
         }
+        /* and so does a copy thread, until it has moved the data */
+        if (qatomic_read(&n->copy_inflight)) {
+            busy = true;
+        }
         /*
          * The FTL thread holds requests too, and for longer than a poller
          * does, so waiting only for the pollers leaves it free to touch state

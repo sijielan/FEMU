@@ -1663,6 +1663,7 @@ enum {
     FEMU_STAGE_PAST_DUE,        /* due time to the posted entry; not in total */
     FEMU_STAGE_COPY_READ,       /* backend copy of a read, inside submit */
     FEMU_STAGE_COPY_WRITE,      /* backend copy of a write, inside submit */
+    FEMU_STAGE_FETCH_WAIT,      /* the sweep's tail read to this fetch */
     FEMU_STAGE_NR,
 };
 
@@ -1709,6 +1710,19 @@ typedef struct NvmeRequest {
     int64_t                 stime;
     /* io_stages: how long the backend copy took, -1 for none */
     int64_t                 t_copy;
+    /* io_stages: how long the command waited in its sweep to be fetched */
+    int64_t                 t_fetch_wait;
+    /*
+     * async_copy: a copy thread moves the data. copy_pending is 1 while it
+     * holds the request (cleared with a store-release when done) and the
+     * completion waits for it; zero, as a zeroed request has it, is ready.
+     * copy_ret is the copy's backend_rw() result.
+     */
+    uint32_t                copy_pending;
+    bool                    copy_waited;    /* went to the backlog for it */
+    int                     copy_ret;
+    uint64_t                copy_off;
+    QSIMPLEQ_ENTRY(NvmeRequest) copy_entry;
     /* io_stages: when the poller handed it to the FTL ring, and got it back */
     int64_t                 t_handoff;
     int64_t                 t_return;
@@ -2235,6 +2249,8 @@ typedef struct FemuPollerCtr {
     int64_t nr_model_ns;
     /* completions held back because the host's completion queue was full */
     int64_t nr_cq_full;
+    /* due completions held back because their async copy had not finished */
+    int64_t nr_copy_waits;
 } QEMU_ALIGNED(64) FemuPollerCtr;
 
 typedef struct FemuCtrl {
@@ -2425,6 +2441,13 @@ typedef struct FemuCtrl {
     uint64_t        mbe_budget_mb;
     bool            mbe_prefetch;
     bool            tag_check;  /* check bbssd reads against FTL tags */
+    uint8_t         async_copy; /* copy threads; 0 copies in the poller */
+    QemuThread      *copy_threads;
+    QemuMutex       copy_lock;
+    QemuCond        copy_cond;
+    QSIMPLEQ_HEAD(, NvmeRequest) copy_queue;
+    uint64_t        copy_inflight;  /* requests a copy thread still owes */
+    bool            copy_stopping;
     char            *precond;   /* bbssd state to write at realize */
     uint64_t        precond_seed;
     char            *precond_save;  /* file to keep that state in */
@@ -2902,6 +2925,9 @@ void bbssd_tag_release(NvmeRequest *req);
 void bbssd_tag_stats(FemuCtrl *n, uint64_t *checked, uint64_t *errors,
                      uint64_t *skipped, uint64_t *injected);
 int bbssd_precond(FemuCtrl *n, Error **errp);
+void nvme_queue_copy(FemuCtrl *n, NvmeRequest *req, uint64_t off);
+void nvme_start_copy_threads(FemuCtrl *n);
+void nvme_stop_copy_threads(FemuCtrl *n);
 
 static inline void nvme_req_release_ranges(NvmeRequest *req)
 {

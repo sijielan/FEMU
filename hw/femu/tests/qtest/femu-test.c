@@ -31682,6 +31682,167 @@ static void femu_test_mbe_tiers(void *obj, void *data, QGuestAllocator *unused)
     qtest_pc_shutdown(qs);
 }
 
+/*
+ * With async_copy the completion of a command never comes before its data:
+ * a write whose copy x-copy-hold stops half way stays without a completion
+ * entry long after the model is done with it, and counts in copy-waits;
+ * once the copy goes on, the write completes and reads back whole.
+ */
+static void femu_test_async_copy_hold(void *obj, void *data,
+                                      QGuestAllocator *alloc)
+{
+    QFemu *femu = obj;
+    QTestState *qts = femu->dev.bus->qts;
+    FemuCtrlState c = { 0 };
+    uint64_t buf = guest_alloc(alloc, 4096);
+    uint8_t got[FEMU_DATA_SIZE];
+    uint32_t stride;
+    NvmeRwCmd rw = { 0 };
+
+    femu_enable(&c, &femu->dev, alloc);
+    femu_create_io_queues(&c);
+    stride = FEMU_DATA_SIZE / c.lba_size;
+    qtest_memset(qts, buf, 0x11, FEMU_DATA_SIZE);
+    g_assert_cmphex(femu_rw(&c, NVME_CMD_WRITE, 3 * stride, buf), ==,
+                    NVME_SUCCESS);
+
+    qtest_qmp_assert_success(qts, "{'execute':'qom-set','arguments':{"
+                             "'path':'/machine/peripheral/mbe',"
+                             "'property':'x-copy-hold','value':1}}");
+    qtest_memset(qts, buf, 0x22, FEMU_DATA_SIZE);
+    rw.opcode = NVME_CMD_WRITE;
+    rw.nsid = cpu_to_le32(1);
+    rw.dptr.prp1 = cpu_to_le64(buf);
+    rw.slba = cpu_to_le64(3 * stride);
+    rw.nlb = cpu_to_le16(stride - 1);
+    femu_submit(&c, &c.io, (NvmeCmd *)&rw);
+    for (int i = 0; i < 5000 && !femu_mbe_get(qts, "x-copy-held"); i++) {
+        g_usleep(1000);
+    }
+    g_assert_cmpuint(femu_mbe_get(qts, "x-copy-held"), ==, 1);
+    /* the program takes well under this; the completion must not come */
+    for (int i = 0; i < 300; i++) {
+        g_assert_false(femu_rwa_cq_ready(&c, &c.io));
+        g_usleep(1000);
+    }
+    g_assert_cmpuint(femu_mbe_get(qts, "copy-waits"), ==, 1);
+    qtest_qmp_assert_success(qts, "{'execute':'qom-set','arguments':{"
+                             "'path':'/machine/peripheral/mbe',"
+                             "'property':'x-copy-hold','value':0}}");
+    g_assert_cmphex(FEMU_SC(femu_complete(&c, &c.io, NULL, NULL)), ==,
+                    NVME_SUCCESS);
+
+    qtest_memset(qts, buf, 0, FEMU_DATA_SIZE);
+    g_assert_cmphex(femu_rw(&c, NVME_CMD_READ, 3 * stride, buf), ==,
+                    NVME_SUCCESS);
+    qtest_memread(qts, buf, got, sizeof(got));
+    for (int j = 0; j < sizeof(got); j++) {
+        g_assert_cmpint(got[j], ==, 0x22);
+    }
+
+    guest_free(alloc, buf);
+    femu_disable(&c);
+    qos_invalidate_command_line();
+}
+
+/*
+ * Data written and read through copy threads is right: random writes of
+ * page patterns, reads checked against them, and bursts of reads of
+ * different pages queued at once so several copies run together. Each
+ * command's copy and fetch wait is timed once, and tag_check sees the FTL
+ * agree.
+ */
+static void femu_test_async_copy_data(void *obj, void *data,
+                                      QGuestAllocator *alloc)
+{
+    QFemu *femu = obj;
+    QTestState *qts = femu->dev.bus->qts;
+    FemuCtrlState c = { 0 };
+    const uint32_t pages = 256;
+    const uint32_t burst = FEMU_QSIZE - 1;
+    uint64_t buf = guest_alloc(alloc, 4096 * burst);
+    uint8_t want[256] = { 0 };
+    uint8_t got[FEMU_DATA_SIZE];
+    uint32_t seed = 21, stride, cmds = 0, reads = 0, writes = 0;
+    QDict *rsp, *ret;
+
+    femu_enable(&c, &femu->dev, alloc);
+    femu_create_io_queues(&c);
+    stride = FEMU_DATA_SIZE / c.lba_size;
+    for (int i = 0; i < 2000; i++) {
+        uint32_t page;
+
+        seed = seed * 1103515245 + 12345;
+        page = (seed >> 8) % pages;
+        if ((seed >> 4) % 3) {
+            want[page] = (seed >> 16) | 1;
+            qtest_memset(qts, buf, want[page], FEMU_DATA_SIZE);
+            g_assert_cmphex(femu_rw(&c, NVME_CMD_WRITE, page * stride, buf),
+                            ==, NVME_SUCCESS);
+            writes++;
+        } else {
+            g_assert_cmphex(femu_rw(&c, NVME_CMD_READ, page * stride, buf),
+                            ==, NVME_SUCCESS);
+            qtest_memread(qts, buf, got, sizeof(got));
+            g_assert_cmpint(got[0], ==, want[page]);
+            g_assert_cmpint(got[sizeof(got) - 1], ==, want[page]);
+            reads++;
+        }
+        cmds++;
+    }
+    for (int r = 0; r < 20; r++) {
+        uint32_t first = r * 11 % (pages - burst);
+
+        for (uint32_t k = 0; k < burst; k++) {
+            NvmeRwCmd rw = { 0 };
+
+            rw.opcode = NVME_CMD_READ;
+            rw.cid = cpu_to_le16(c.cid++);
+            rw.nsid = cpu_to_le32(1);
+            rw.dptr.prp1 = cpu_to_le64(buf + k * 4096);
+            rw.slba = cpu_to_le64((uint64_t)(first + k) * stride);
+            rw.nlb = cpu_to_le16(stride - 1);
+            qtest_memwrite(qts, c.io.sq_addr + c.io.sq_tail * sizeof(NvmeCmd),
+                           &rw, sizeof(rw));
+            c.io.sq_tail = (c.io.sq_tail + 1) % FEMU_QSIZE;
+        }
+        qpci_io_writel(c.pdev, c.bar, femu_sq_doorbell(&c, c.io.qid),
+                       c.io.sq_tail);
+        for (uint32_t k = 0; k < burst; k++) {
+            g_assert_cmphex(FEMU_SC(femu_complete(&c, &c.io, NULL, NULL)), ==,
+                            NVME_SUCCESS);
+        }
+        for (uint32_t k = 0; k < burst; k++) {
+            qtest_memread(qts, buf + k * 4096, got, sizeof(got));
+            g_assert_cmpint(got[0], ==, want[first + k]);
+            g_assert_cmpint(got[sizeof(got) - 1], ==, want[first + k]);
+        }
+        cmds += burst;
+        reads += burst;
+    }
+
+    rsp = qtest_qmp(qts, "{'execute':'query-femu-stages',"
+                    "'arguments':{'path':'/machine/peripheral/mbe'}}");
+    ret = qdict_get_qdict(rsp, "return");
+    g_assert_cmpint(qdict_get_int(femu_stage(ret, "copy-read"), "count"), ==,
+                    reads);
+    g_assert_cmpint(qdict_get_int(femu_stage(ret, "copy-write"), "count"), ==,
+                    writes);
+    g_assert_cmpint(qdict_get_int(femu_stage(ret, "fetch-wait"), "count"), ==,
+                    cmds);
+    g_test_message("%u reads, %u writes; copy waits %" PRIu64 ", fetch wait "
+                   "max %" PRId64 " ns, tag errors %" PRIu64, reads, writes,
+                   femu_mbe_get(qts, "copy-waits"),
+                   qdict_get_int(femu_stage(ret, "fetch-wait"), "max-ns"),
+                   femu_mbe_get(qts, "tag-errors"));
+    qobject_unref(rsp);
+    g_assert_cmpuint(femu_mbe_get(qts, "tag-errors"), ==, 0);
+
+    guest_free(alloc, buf);
+    femu_disable(&c);
+    qos_invalidate_command_line();
+}
+
 /* mbe_* settings a backend type does not read fail realize */
 static void femu_test_mbe_refused(void *obj, void *data,
                                   QGuestAllocator *alloc)
@@ -31717,6 +31878,11 @@ static void femu_test_mbe_refused(void *obj, void *data,
         { "'mbe_type':'none','mbe_pin_meta':false,'mbe_thp':true",
           "mbe_thp and mbe_lock need mbe_type=sparse" },
         { "'tag_check':true", "tag_check needs femu_mode=1" },
+        { "'async_copy':2", "async_copy needs bbssd, or NoSSD with "
+          "hiops_inline=off" },
+        { "'async_copy':65,'femu_mode':1", "async_copy takes 0 to 64" },
+        { "'async_copy':1,'femu_mode':1,'pi':true",
+          "async_copy cannot be used with" },
         { "'precond':'rand:0'", "is not none, seq, rand or rand:N" },
         { "'precond':'seq'", "precond needs femu_mode=1" },
         { "'precond':'seq','femu_mode':1,'power_loss':true,'buffer_size':16",
@@ -32787,6 +32953,18 @@ static void femu_register_nodes(void)
                  NULL);
     qos_add_test("precond-save-load", "femu", femu_test_precond_save_load,
                  NULL);
+    qos_add_test("async-copy-hold", "femu", femu_test_async_copy_hold,
+                 &(QOSGraphTestOptions) {
+        .edge.extra_device_opts = FEMU_TAG_GEO ",async_copy=1" });
+    qos_add_test("async-copy-data", "femu", femu_test_async_copy_data,
+                 &(QOSGraphTestOptions) {
+        .edge.extra_device_opts = FEMU_TAG_GEO ",async_copy=2,io_stages=on,"
+                                  "mbe_type=sparse,mbe_pin_meta=off" });
+    qos_add_test("async-copy-data-nossd", "femu", femu_test_async_copy_data,
+                 &(QOSGraphTestOptions) {
+        .edge.extra_device_opts = "id=mbe,devsz_mb=1,femu_mode=2,"
+                                  "hiops_inline=off,async_copy=1,"
+                                  "io_stages=on" });
     qos_add_test("tag-inject-swallow-write", "femu", femu_test_tag_inject,
                  &(QOSGraphTestOptions) {
         .arg = (void *)"swallow-write", .edge.extra_device_opts = FEMU_TAG_GEO });

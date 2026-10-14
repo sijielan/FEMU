@@ -864,11 +864,17 @@
 # @copy-write: the same for a write's data, from the host to the
 #     backend.
 #
+# @fetch-wait: from the poller's read of the submission queue tail to
+#     the fetch of the command, in the same sweep.  It grows when the
+#     poller copies data for the commands ahead of it, and is a lower
+#     bound of the time from the doorbell to the fetch.  It is not part
+#     of total, which starts at the fetch.
+#
 # Since: 10.1
 ##
 { 'enum': 'FemuIoStage',
   'data': [ 'submit', 'ftl', 'hold', 'post-delay', 'total', 'past-due',
-            'copy-read', 'copy-write' ] }
+            'copy-read', 'copy-write', 'fetch-wait' ] }
 
 ##
 # @FemuIoStageInfo:

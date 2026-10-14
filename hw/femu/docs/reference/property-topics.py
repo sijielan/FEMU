@@ -36,6 +36,7 @@ DEVICES = [
                 "props": [
                     "mbe_type", "mbe_file", "mbe_thp", "mbe_lock",
                     "mbe_pin_meta", "mbe_budget_mb", "mbe_prefetch",
+                    "async_copy",
                 ],
             },
             {
@@ -200,7 +201,7 @@ DEVICES = [
                 "title": "Memory backend usage",
                 "kind": "runtime",
                 "props": [
-                    "mbe-resident", "mbe-evicted", "mbe-swapped",
+                    "mbe-resident", "mbe-evicted", "mbe-swapped", "copy-waits",
                     "mbe-zswap-pool", "mbe-zswapped",
                 ],
             },

@@ -11,6 +11,7 @@ static uint16_t nvme_io_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeRequest *req);
 
 static void nvme_post_cqe(NvmeCQueue *cq, NvmeRequest *req);
 static void nvme_cq_notify(FemuCtrl *n, NvmeCQueue *cq);
+static void nvme_take_copy_status(NvmeRequest *req);
 
 /* one writer per set; atomic stores so a QMP read sees each word whole */
 static void nvme_stage_add(FemuStageHist *h, int64_t ns)
@@ -60,6 +61,9 @@ static void nvme_stages_note(FemuCtrl *n, int index_poller, NvmeRequest *req,
         nvme_stage_add(&set->st[req->is_write ? FEMU_STAGE_COPY_WRITE
                                                : FEMU_STAGE_COPY_READ],
                        req->t_copy);
+    }
+    if (req->t_fetch_wait >= 0) {
+        nvme_stage_add(&set->st[FEMU_STAGE_FETCH_WAIT], req->t_fetch_wait);
     }
     nvme_stage_add(&set->st[FEMU_STAGE_POST_DELAY], post - ready);
     nvme_stage_add(&set->st[FEMU_STAGE_PAST_DUE], post - req->expire_time);
@@ -118,10 +122,26 @@ static int nvme_post_backlog(FemuCtrl *n, int index_poller, bool *should_isr)
     QTAILQ_FOREACH_SAFE(req, backlog, entry, next) {
         NvmeCQueue *cq = n->cq[req->sq->cqid];
 
+        /* due, but its async copy has not moved the data yet */
+        if (qatomic_load_acquire(&req->copy_pending)) {
+            continue;
+        }
+        nvme_take_copy_status(req);
         if (!nvme_try_post_cqe(n, cq, req)) {
             continue;
         }
         QTAILQ_REMOVE(backlog, req, entry);
+        if (req->copy_waited) {
+            int64_t now = nvme_io_clock(n);
+            FemuPollerCtr *ctr = &n->poller_ctr[index_poller];
+
+            req->copy_waited = false;
+            ctr->nr_tt_ios++;
+            ctr->nr_model_ns += req->reqlat;
+            if (now - req->expire_time >= 20000) {
+                ctr->nr_tt_late_ios++;
+            }
+        }
         if (n->stage_sets) {
             nvme_stages_note(n, index_poller, req, nvme_io_clock(n));
         }
@@ -195,6 +215,112 @@ static inline void nvme_copy_cmd(NvmeCmd *dst, NvmeCmd *src)
 #endif
 }
 
+/*
+ * async_copy: copy threads move the data between guest memory and the
+ * backend while the request is timed, so a poller never waits on a copy
+ * that misses host memory and the commands behind it are fetched on time.
+ * The request is the job: its scatter list and backend offset go to a copy
+ * thread, and the completion waits until the thread has cleared
+ * copy_pending (release, paired with the poller's acquire), never posting
+ * before the data is in the guest's buffer or out of it. A pause waits for
+ * the copies in flight, so nothing an admin command frees is still in use.
+ */
+static void *nvme_copy_thread(void *opaque)
+{
+    FemuCtrl *n = opaque;
+
+    rcu_register_thread();
+    qemu_mutex_lock(&n->copy_lock);
+    for (;;) {
+        NvmeRequest *req;
+        int64_t t0;
+        int ret;
+
+        while (!n->copy_stopping && QSIMPLEQ_EMPTY(&n->copy_queue)) {
+            qemu_cond_wait(&n->copy_cond, &n->copy_lock);
+        }
+        req = QSIMPLEQ_FIRST(&n->copy_queue);
+        if (!req) {
+            break;
+        }
+        QSIMPLEQ_REMOVE_HEAD(&n->copy_queue, copy_entry);
+        qemu_mutex_unlock(&n->copy_lock);
+
+        t0 = n->stage_sets ? nvme_io_clock(n) : 0;
+        ret = backend_rw(n->mbe, &req->qsg, &req->copy_off, req->is_write);
+        if (n->stage_sets) {
+            req->t_copy = nvme_io_clock(n) - t0;
+        }
+        req->copy_ret = ret;
+        qatomic_store_release(&req->copy_pending, 0);
+        qatomic_dec(&n->copy_inflight);
+
+        qemu_mutex_lock(&n->copy_lock);
+    }
+    qemu_mutex_unlock(&n->copy_lock);
+    rcu_unregister_thread();
+    return NULL;
+}
+
+void nvme_queue_copy(FemuCtrl *n, NvmeRequest *req, uint64_t off)
+{
+    req->copy_off = off;
+    req->copy_ret = 0;
+    req->copy_pending = 1;
+    qatomic_inc(&n->copy_inflight);
+    qemu_mutex_lock(&n->copy_lock);
+    QSIMPLEQ_INSERT_TAIL(&n->copy_queue, req, copy_entry);
+    qemu_cond_signal(&n->copy_cond);
+    qemu_mutex_unlock(&n->copy_lock);
+}
+
+void nvme_start_copy_threads(FemuCtrl *n)
+{
+    char name[32];
+
+    if (!n->async_copy) {
+        return;
+    }
+    qemu_mutex_init(&n->copy_lock);
+    qemu_cond_init(&n->copy_cond);
+    QSIMPLEQ_INIT(&n->copy_queue);
+    n->copy_inflight = 0;
+    n->copy_stopping = false;
+    n->copy_threads = g_new0(QemuThread, n->async_copy);
+    for (int i = 0; i < n->async_copy; i++) {
+        snprintf(name, sizeof(name), "femu-copy-%d", i);
+        qemu_thread_create(&n->copy_threads[i], name, nvme_copy_thread, n,
+                           QEMU_THREAD_JOINABLE);
+    }
+}
+
+void nvme_stop_copy_threads(FemuCtrl *n)
+{
+    if (!n->copy_threads) {
+        return;
+    }
+    qemu_mutex_lock(&n->copy_lock);
+    n->copy_stopping = true;
+    qemu_cond_broadcast(&n->copy_cond);
+    qemu_mutex_unlock(&n->copy_lock);
+    for (int i = 0; i < n->async_copy; i++) {
+        qemu_thread_join(&n->copy_threads[i]);
+    }
+    g_free(n->copy_threads);
+    n->copy_threads = NULL;
+    qemu_cond_destroy(&n->copy_cond);
+    qemu_mutex_destroy(&n->copy_lock);
+}
+
+/* a failed async copy fails its command, as a failed copy in nvme_rw does */
+static void nvme_take_copy_status(NvmeRequest *req)
+{
+    if (unlikely(req->copy_ret)) {
+        req->status = nvme_backend_status(req->copy_ret);
+        req->copy_ret = 0;
+    }
+}
+
 /* how far into a submission queue a sweep reads ahead */
 #define NVME_PREFETCH_MAX_SQES  256
 
@@ -259,8 +385,10 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
      */
     bool inline_mode = NOSSD(n) && n->hiops_inline;
     bool did_isr = false;
+    int64_t t_tail;
 
     nvme_update_sq_tail(sq);
+    t_tail = n->stage_sets ? nvme_io_clock(n) : 0;
     /* shared namespaces change under the subsystem lock, not taken here */
     if (n->mbe->prefetch && sq->phys_contig && !nvme_ns_shared(n)) {
         nvme_prefetch_sq_reads(n, sq);
@@ -346,6 +474,9 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
         req->expire_time = req->stime = nvme_io_clock(n);
         req->t_handoff = 0;
         req->t_copy = -1;
+        req->t_fetch_wait = n->stage_sets ? req->stime - t_tail : -1;
+        req->copy_waited = false;
+        req->copy_ret = 0;
         req->t_return = 0;
         req->cqe.cid = cmd.cid;
         req->cmd_opcode = cmd.opcode;
@@ -803,6 +934,14 @@ static void nvme_process_cq_cpl(void *arg, int index_poller)
          */
         cq = n->cq[req->sq->cqid];
         nvme_req_release_ranges(req);
+        if (unlikely(qatomic_load_acquire(&req->copy_pending))) {
+            /* never before its data: wait in the backlog for the copy */
+            req->copy_waited = true;
+            n->poller_ctr[index_poller].nr_copy_waits++;
+            QTAILQ_INSERT_TAIL(&n->cpl_backlog[index_poller], req, entry);
+            continue;
+        }
+        nvme_take_copy_status(req);
         if (!cq->is_active) {
             /* CQ inactive: return request to SQ free list to avoid leak */
             QTAILQ_INSERT_TAIL(&req->sq->req_list, req, entry);
@@ -1297,6 +1436,13 @@ mapped:
     /* a read takes a block's data and metadata as one snapshot */
     if (meta_size) {
         qemu_mutex_lock(&ns->mdata_lock);
+    }
+    if (n->async_copy && !meta_size) {
+        nvme_queue_copy(n, req, data_offset);
+        if (req->is_write) {
+            nvme_mark_written(ns, slba, nlb);
+        }
+        return NVME_SUCCESS;
     }
     if (n->stage_sets) {
         req->t_copy = nvme_io_clock(n);

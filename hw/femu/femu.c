@@ -2335,6 +2335,7 @@ static bool femu_cxl_link_check(FemuCtrl *n, Error **errp)
  */
 static void femu_realize_undo(FemuCtrl *n)
 {
+    nvme_stop_copy_threads(n);
     /*
      * Namespaces that did come up own an FTL and its channel tree, which is
      * the largest allocation here. Every mode's exit tests the state it frees
@@ -2651,6 +2652,35 @@ static bool femu_check_tag_props(FemuCtrl *n, Error **errp)
         error_setg(errp, "femu: tag_check cannot follow pages with "
                    "power_loss, cxl_ssd, shared namespaces or "
                    "fdp_trim_erase_all");
+        return false;
+    }
+    return true;
+}
+
+/*
+ * async_copy moves the data after nvme_rw() returns, so only a command whose
+ * completion goes through the pollers' due-time queue can wait for it: not
+ * NoSSD's inline completion, which posts in the same sweep. Metadata,
+ * protection information and the power loss buffer read or write the data
+ * again after the copy, so those stay synchronous by refusing them.
+ */
+static bool femu_check_async_copy_props(FemuCtrl *n, Error **errp)
+{
+    if (!n->async_copy) {
+        return true;
+    }
+    if (n->async_copy > 64) {
+        error_setg(errp, "femu: async_copy takes 0 to 64 copy threads");
+        return false;
+    }
+    if (!BBSSD(n) && !(NOSSD(n) && !n->hiops_inline)) {
+        error_setg(errp, "femu: async_copy needs bbssd, or NoSSD with "
+                   "hiops_inline=off");
+        return false;
+    }
+    if (n->meta || n->pi || n->extended || n->power_loss || n->cxl_dev) {
+        error_setg(errp, "femu: async_copy cannot be used with meta, pi, "
+                   "extended, power_loss or cxl_ssd");
         return false;
     }
     return true;
@@ -2980,6 +3010,9 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
     if (!femu_check_precond_props(n, errp)) {
         return;
     }
+    if (!femu_check_async_copy_props(n, errp)) {
+        return;
+    }
 
     /* Format and Sanitize would rewrite the whole medium under its cache. */
     if (n->cxl_dev) {
@@ -3197,6 +3230,7 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
         femu_realize_undo(n);
         return;
     }
+    nvme_start_copy_threads(n);
 
     /*
      * One FTL thread serves every namespace that needs one. It is started after
@@ -3392,6 +3426,7 @@ static void femu_exit(PCIDevice *pci_dev)
 
     nvme_clear_ctrl(n, true);
     nvme_destroy_poller(n);
+    nvme_stop_copy_threads(n);
     /* the pollers are gone, so nothing can wake the bottom half any more */
     qemu_bh_delete(n->aer_bh);
     n->aer_bh = NULL;
@@ -3459,6 +3494,7 @@ static const Property femu_props[] = {
     DEFINE_PROP_UINT64("mbe_budget_mb", FemuCtrl, mbe_budget_mb, 0),
     DEFINE_PROP_BOOL("mbe_prefetch", FemuCtrl, mbe_prefetch, true),
     DEFINE_PROP_BOOL("tag_check", FemuCtrl, tag_check, false),
+    DEFINE_PROP_UINT8("async_copy", FemuCtrl, async_copy, 0),
     DEFINE_PROP_STRING("precond", FemuCtrl, precond),
     DEFINE_PROP_UINT64("precond_seed", FemuCtrl, precond_seed, 1),
     DEFINE_PROP_STRING("precond_save", FemuCtrl, precond_save),
@@ -4010,6 +4046,19 @@ static void femu_mbe_resident_get(Object *obj, Visitor *v, const char *name,
     visit_type_uint64(v, name, &value, errp);
 }
 
+/* completions that fell due before their async copy had moved the data */
+static void femu_copy_waits_get(Object *obj, Visitor *v, const char *name,
+                                void *opaque, Error **errp)
+{
+    FemuCtrl *n = FEMU(obj);
+    uint64_t value = 0;
+
+    for (int p = 1; n->poller_ctr && p <= (int)n->nr_pollers; p++) {
+        value += qatomic_read(&n->poller_ctr[p].nr_copy_waits);
+    }
+    visit_type_uint64(v, name, &value, errp);
+}
+
 static void femu_mbe_swapped_get(Object *obj, Visitor *v, const char *name,
                                  void *opaque, Error **errp)
 {
@@ -4075,6 +4124,8 @@ static void femu_instance_init(Object *obj)
     object_property_add(obj, "mbe-evicted", "uint64", femu_mbe_evicted_get,
                         NULL, NULL, NULL);
     object_property_add(obj, "mbe-swapped", "uint64", femu_mbe_swapped_get,
+                        NULL, NULL, NULL);
+    object_property_add(obj, "copy-waits", "uint64", femu_copy_waits_get,
                         NULL, NULL, NULL);
     object_property_add(obj, "mbe-zswap-pool", "uint64", femu_mbe_zswap_get,
                         NULL, NULL, (void *)0);

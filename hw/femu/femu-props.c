@@ -106,6 +106,12 @@ static const FemuPropDesc femu_ctrl_descs[] = {
       "check every read against the versions NVMe allows, catching mapping, "
       "collection and deallocate bugs the data does not show; mapping=page "
       "or dftl, not with power_loss; off by default" },
+    { "async_copy",
+      "Copy threads that move I/O data between guest memory and the backend "
+      "while the command is timed, so a poller never waits on a copy that "
+      "misses host memory; a completion waits for its copy; 0 (default) "
+      "copies in the poller; bbssd or NoSSD with hiops_inline=off, without "
+      "meta, pi or power_loss; up to 64" },
     { "precond",
       "bbssd: write every namespace at realize through the FTL, untimed, "
       "before the guest starts: seq fills it in order, rand:N then writes "
@@ -777,6 +783,9 @@ static const FemuPropDesc femu_ctrl_runtime_descs[] = {
     { "tag-skipped",
       "Read-only: logical pages read that tag_check could not check, as "
       "their last change was a Copy or failed" },
+    { "copy-waits",
+      "Read-only: completions that fell due before their async_copy had "
+      "moved the data, and waited for it" },
     { "mbe-swapped",
       "Read-only: bytes of a mbe_type=sparse backend the host has swapped "
       "out, to zswap or a swap device (pagemap); 0 for other types" },

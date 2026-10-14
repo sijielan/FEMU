@@ -22,7 +22,7 @@ Devices:
 
 ## `femu`: NVMe controller
 
-`-device femu` has 198 properties of its own and 9 QOM properties listed in [runtime-properties.md](runtime-properties.md).
+`-device femu` has 199 properties of its own and 10 QOM properties listed in [runtime-properties.md](runtime-properties.md).
 
 ### Mode, capacity and namespaces
 
@@ -50,6 +50,7 @@ Devices:
 | `mbe_pin_meta` | `bool` | `on` | mbe_type=sparse or file: pin all process memory other than the backend data as it is touched (mlockall), so FTL metadata and FEMU threads never page out; needs RLIMIT_MEMLOCK unlimited, off only for unprivileged runs |
 | `mbe_budget_mb` | `uint64` | `0` | mbe_type=sparse or file: MiB of backend data to keep in host memory; a background thread evicts the least recently used 2 MiB chunks above it, sparse ones to swap (which the host must have); 0 (the default) evicts nothing |
 | `mbe_prefetch` | `bool` | `on` | mbe_type=sparse or file: before a poller runs the reads waiting in a queue, ask the host for all their data at once (MADV_WILLNEED), so reads that miss host memory wait together rather than one by one; on by default |
+| `async_copy` | `uint8` | `0` | Copy threads that move I/O data between guest memory and the backend while the command is timed, so a poller never waits on a copy that misses host memory; a completion waits for its copy; 0 (default) copies in the poller; bbssd or NoSSD with hiops_inline=off, without meta, pi or power_loss; up to 64 |
 
 ### FTL tag checker (bbssd)
 
