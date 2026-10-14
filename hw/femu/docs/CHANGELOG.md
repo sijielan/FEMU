@@ -37,6 +37,16 @@ listed one by one.
 - The `femu-cxl-ssd` FTL worker wakes only the access whose request it finished, instead of every waiting access. On a `der=cylon` test with 8 and 16 vCPUs doing random reads that all miss a 256-page cache, throughput rose about 40% (65k to 91k and 70k to 98k accesses/s), because waiters no longer wake for other requests.
 - `der=cylon` also accepts slot tables that the host kernel maps as refcounted pages (`mm` in `/proc/self/smaps`), not only as raw PFNs (`pf`). A Cylon kernel that maps them this way can free the tables of a deleted slot once FEMU unmaps them.
 
+#### Running with less host DRAM
+
+- The memory backend no longer has to hold the whole device in pinned DRAM. `mbe_type=sparse` takes host memory only for the blocks written, `mbe_type=file` maps `mbe_file` so the page cache holds the data, and `mbe_type=none` keeps no data; Deallocate, Format, Sanitize and namespace creation give pages back instead of faulting them in. `mbe_pin_meta` pins the rest of the process so only data is reclaimed, and `mbe-resident` reports what is in memory (b374b08a5, 3ff2020eb).
+- `mbe_budget_mb` keeps a sparse or file backend's data within a budget from a thread of its own, and `mbe_prefetch` reads ahead the data of the reads waiting in a queue (e8bef44b6).
+- `tag_check` keeps a tag with each NAND page and checks every read against the versions NVMe allows, catching mapping, collection and deallocate bugs that FEMU's LBA-addressed data cannot show; `x-tag-inject` proves it under qtest (b61cf1039).
+- `precond=seq|rand:N` brings bbssd namespaces to steady state at realize through the FTL's own path, untimed, and `precond_save`/`precond_load` keep that state, FDP reclaim units included (17ecd5d18, 0c7bcb0bc).
+- `io_stages` times the backend copy (`copy-read`, `copy-write`) and the wait for the poller (`fetch-wait`); `mbe-swapped`, `mbe-zswap-pool` and `mbe-zswapped` report the host tiers, and `lessdram-host.sh` and `lessdram-compress-ratio.py` set up and size them (9e48f7538, 8ca990cae).
+- `async_copy` moves I/O data on copy threads while the command is timed, and a completion waits for its data (8ca990cae).
+- bbssd addresses devices past 2^31 sectors (1 TiB with 512-byte sectors), and keeps one byte of status per page (7ca8e5b81).
+
 #### New modes and data placement
 
 - Flexible Data Placement (FDP) on a new `femu-subsys` device, with reclaim unit handles, FDP log pages, I/O Management commands and several GC strategies (c966d341a, 6df00de01).
