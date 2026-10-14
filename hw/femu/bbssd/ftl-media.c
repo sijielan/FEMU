@@ -287,10 +287,16 @@ void bb_nand_media_refresh_timing(struct ssd *ssd)
 uint64_t ssd_advance_status(struct ssd *ssd, struct ppa *ppa,
                             struct nand_cmd *ncmd)
 {
-    uint64_t stime = (ncmd->stime == 0) ?
-        qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : ncmd->stime;
+    uint64_t stime;
     NandLoc loc;
     NandMediaOp op;
+
+    /* precond: the state, not the time, of the commands is wanted */
+    if (unlikely(ssd->untimed)) {
+        return 0;
+    }
+    stime = (ncmd->stime == 0) ?
+        qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : ncmd->stime;
 
     switch (ncmd->cmd) {
     case NAND_READ:  op = NAND_MEDIA_READ;    break;
@@ -339,7 +345,7 @@ uint64_t ssd_advance_status_multiplane(struct ssd *ssd, struct ppa *ppas,
     NandMediaOp op;
     int i;
 
-    if (nppas <= 1) {
+    if (nppas <= 1 || unlikely(ssd->untimed)) {
         return ssd_advance_status(ssd, &ppas[0], ncmd);
     }
     ftl_assert(nppas <= (1 << PL_BITS));
@@ -408,6 +414,10 @@ uint64_t ssd_advance_copyback(struct ssd *ssd, struct ppa *src,
     uint64_t stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     NandLoc sloc;
     NandLoc dloc;
+
+    if (unlikely(ssd->untimed)) {
+        return 0;
+    }
 
     get_blk(ssd, src)->read_cnt++;
     ssd->media_ops[NAND_MEDIA_READ]++;

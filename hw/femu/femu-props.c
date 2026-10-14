@@ -106,6 +106,22 @@ static const FemuPropDesc femu_ctrl_descs[] = {
       "check every read against the versions NVMe allows, catching mapping, "
       "collection and deallocate bugs the data does not show; mapping=page "
       "or dftl, not with power_loss; off by default" },
+    { "precond",
+      "bbssd: write every namespace at realize through the FTL, untimed, "
+      "before the guest starts: seq fills it in order, rand:N then writes "
+      "N times its capacity to random pages (N 1 to 100); block content is "
+      "undefined after it; none (default) writes nothing" },
+    { "precond_seed",
+      "Seed of the random page order precond=rand uses; the same seed and "
+      "geometry give the same FTL state" },
+    { "precond_save",
+      "Host file to keep the FTL state precond built in, for precond_load "
+      "to start from; page or dftl mapping without FDP, streams, "
+      "hot_cold_sep, gc_pace or blk_pe_limit" },
+    { "precond_load",
+      "Host file a precond_save run wrote: start every bbssd namespace "
+      "from that FTL state instead of running precond; geometry, size, "
+      "LBA format, mapping and tag_check must match" },
     { "namespaces",
       "Number of namespaces created at boot, 1 to 256; OCSSD and FDP "
       "support only 1" },

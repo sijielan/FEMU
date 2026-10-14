@@ -556,3 +556,53 @@ void bbssd_tag_stats(FemuCtrl *n, uint64_t *checked, uint64_t *errors,
     }
 }
 
+/*
+ * With the I/O stopped, check every logical page's mapping against what the
+ * I/O layer expects: a page last written maps to a page tagged with that
+ * write, any other page maps to nothing, unless its last change was not
+ * modelled. precond runs this on the state it built. Returns the pages found
+ * wrong, logging the first.
+ */
+uint64_t ftl_tag_scan(struct ssd *ssd)
+{
+    struct ftl_tag *t = ssd->tag;
+    uint64_t bad = 0;
+
+    if (!t) {
+        return 0;
+    }
+    for (uint64_t lpn = 0; lpn < t->nr_lpns; lpn++) {
+        uint32_t cp = t->completed[lpn];
+        struct ppa ppa = get_maptbl_ent(ssd, lpn);
+        bool mapped = mapped_ppa(&ppa) && valid_ppa(ssd, &ppa);
+        uint64_t want = lpn << TAG_VER_BITS | (cp & TAG_VER_MASK);
+        uint64_t got = mapped ? t->page[ppa2pgidx(ssd, &ppa)]
+                              : FTL_TAG_UNMAPPED;
+        bool live = (cp & CP_WRITTEN) && !(cp & CP_TRIM);
+
+        if (cp & CP_UNTRACKED) {
+            continue;
+        }
+        if (live ? got == want : !mapped) {
+            continue;
+        }
+        if (bad++ < TAG_LOG_MAX) {
+            femu_err("tag_check scan: lpn %" PRIu64 " expected %s version "
+                     "%u, found %s 0x%" PRIx64 "\n", lpn,
+                     live ? "tag" : "no mapping", cp & TAG_VER_MASK,
+                     mapped ? "tag" : "no mapping", got);
+        }
+    }
+    qatomic_add(&t->checked, t->nr_lpns);
+    qatomic_add(&t->errors, bad);
+    return bad;
+}
+
+/* the arrays precond_save writes and precond_load fills */
+void ftl_tag_get_arrays(struct ssd *ssd, struct ftl_tag_arrays *a)
+{
+    a->nr_lpns = ssd->tag->nr_lpns;
+    a->page = ssd->tag->page;
+    a->state = ssd->tag->state;
+    a->completed = ssd->tag->completed;
+}

@@ -639,6 +639,7 @@ struct ssd {
     unsigned long *fdp_written;
     uint64_t fdp_written_bits;
     struct ftl_tag *tag;    /* tag_check state, NULL when off; ftl-tag.c */
+    bool untimed;           /* precond: NAND commands take no time */
 };
 
 int bb_check_geometry(FemuCtrl *n, Error **errp);
@@ -728,6 +729,18 @@ void ftl_tag_erase(struct ssd *ssd, struct ppa *blk);
 void ftl_tag_read(struct ssd *ssd, NvmeRequest *req, uint64_t lpn,
                   struct ppa *ppa, uint64_t buffered);
 bool ftl_tag_inject(struct ssd *ssd, int point);
+uint64_t ftl_tag_scan(struct ssd *ssd);
+int ftl_precond_parse(const char *spec, int *passes, Error **errp);
+struct ftl_tag_arrays {
+    uint64_t nr_lpns;
+    uint64_t *page;
+    uint64_t *state;
+    uint32_t *completed;
+};
+void ftl_tag_get_arrays(struct ssd *ssd, struct ftl_tag_arrays *a);
+bool ftl_state_supported(FemuCtrl *n, Error **errp);
+int ftl_state_save(FemuCtrl *n, const char *path, Error **errp);
+int ftl_state_load(FemuCtrl *n, const char *path, Error **errp);
 
 /* fault injection points for qtest, to show the checker catches each */
 enum {

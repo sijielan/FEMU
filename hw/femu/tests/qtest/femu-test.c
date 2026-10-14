@@ -31415,6 +31415,159 @@ static void femu_test_tag_inject(void *obj, void *data, QGuestAllocator *alloc)
     qos_invalidate_command_line();
 }
 
+/*
+ * precond hands the guest a namespace already written: tag_check's scan of
+ * every mapping at realize finds none wrong, the counters start from zero,
+ * every page reads, and collection runs as soon as the guest writes. @data
+ * is the number of FDP handles to place the workload's writes on.
+ */
+static void femu_test_precond(void *obj, void *data, QGuestAllocator *alloc)
+{
+    QFemu *femu = obj;
+    QTestState *qts = femu->dev.bus->qts;
+    FemuCtrlState c = { 0 };
+    const uint32_t pages = 256;
+    int nruh = atoi(data);
+    uint64_t buf = guest_alloc(alloc, 4096);
+    uint64_t list = guest_alloc(alloc, 4096);
+    uint32_t seed = 3;
+
+    g_assert_cmpuint(femu_mbe_get(qts, "tag-errors"), ==, 0);
+    g_assert_cmpuint(femu_mbe_get(qts, "tag-checked"), >=, pages);
+    femu_enable(&c, &femu->dev, alloc);
+    femu_create_io_queues(&c);
+    g_assert_cmpuint(femu_gc_pages(&c, list), ==, 0);
+    for (uint32_t page = 0; page < pages; page++) {
+        g_assert_cmphex(femu_tag_read(&c, page, buf), ==, NVME_SUCCESS);
+    }
+    g_assert_cmpuint(femu_mbe_get(qts, "tag-errors"), ==, 0);
+    qtest_memset(qts, buf, 0x3c, 4096);
+    femu_tag_workload(&c, buf, list, pages, nruh, 300, &seed);
+    g_test_message("collected %" PRIu64 " pages, checked %" PRIu64,
+                   femu_gc_pages(&c, list), femu_mbe_get(qts, "tag-checked"));
+    g_assert_cmpuint(femu_mbe_get(qts, "tag-errors"), ==, 0);
+    g_assert_cmpuint(femu_gc_pages(&c, list), >, 0);
+
+    guest_free(alloc, list);
+    guest_free(alloc, buf);
+    femu_disable(&c);
+    qos_invalidate_command_line();
+}
+
+#define FEMU_PRECOND_GEO "devsz_mb=1,femu_mode=1,secsz=512,secs_per_pg=8," \
+    "pgs_per_blk=4,blks_per_pl=25,pls_per_lun=1,luns_per_ch=2,nchs=2"
+
+/*
+ * Boot a controller with @opts, run the writes the guest owes when @replay
+ * (precond=rand:1 with seed 7, done by hand), then a fixed run of random
+ * page writes, and return the pages collection relocated during that run.
+ */
+static uint64_t femu_precond_run(const char *opts, bool replay)
+{
+    const uint32_t pages = 256;
+    QOSState *qs = qtest_pc_boot("-machine pc -nodefaults -device femu,id=mbe,"
+                                 "addr=5," FEMU_PRECOND_GEO "%s", opts);
+    QPCIDevice *pdev = qpci_device_find(qs->pcibus, QPCI_DEVFN(5, 0));
+    FemuCtrlState c = { 0 };
+    uint64_t buf = guest_alloc(&qs->alloc, 4096);
+    uint64_t list = guest_alloc(&qs->alloc, 4096);
+    uint64_t before, rng = 7;
+    uint32_t seed = 9;
+
+    femu_enable(&c, pdev, &qs->alloc);
+    femu_create_io_queues(&c);
+    if (replay) {
+        for (uint32_t page = 0; page < pages; page += 64) {
+            g_assert_cmphex(FEMU_SC(femu_write_pages_placed(&c, page, 64, buf,
+                                                            list, -1)),
+                            ==, NVME_SUCCESS);
+        }
+        for (uint32_t i = 0; i < pages; i++) {
+            rng ^= rng >> 12;
+            rng ^= rng << 25;
+            rng ^= rng >> 27;
+            g_assert_cmphex(FEMU_SC(femu_write_pages_placed(
+                                &c, (rng * 0x2545F4914F6CDD1DULL) % pages, 1,
+                                buf, list, -1)), ==, NVME_SUCCESS);
+        }
+    }
+    before = femu_gc_pages(&c, list);
+    for (int i = 0; i < 600; i++) {
+        seed = seed * 1103515245 + 12345;
+        g_assert_cmphex(FEMU_SC(femu_write_pages_placed(
+                            &c, (seed >> 8) % pages, 1, buf, list, -1)), ==,
+                        NVME_SUCCESS);
+    }
+    before = femu_gc_pages(&c, list) - before;
+
+    femu_disable(&c);
+    guest_free(&qs->alloc, list);
+    guest_free(&qs->alloc, buf);
+    g_free(pdev);
+    qtest_pc_shutdown(qs);
+    return before;
+}
+
+/*
+ * precond_load starts from the FTL precond_save kept: the same run of writes
+ * then makes collection move as many pages as after the precond that built
+ * it, tag_check finds every mapping right, and a file saved for another
+ * geometry is refused.
+ */
+static void femu_test_precond_save_load(void *obj, void *data,
+                                        QGuestAllocator *unused)
+{
+    QFemu *femu = obj;
+    QTestState *qts = femu->dev.bus->qts;
+    g_autofree char *dir = g_dir_make_tmp("femu-state-XXXXXX", NULL);
+    g_autofree char *path = g_build_filename(dir, "ftl", NULL);
+    g_autofree char *save = g_strdup_printf(",tag_check=on,precond=rand:2,"
+                                            "precond_save=%s", path);
+    g_autofree char *load = g_strdup_printf(",tag_check=on,precond_load=%s",
+                                            path);
+    g_autofree char *cmd = NULL;
+    uint64_t saved = femu_precond_run(save, false);
+    uint64_t loaded = femu_precond_run(load, false);
+    QDict *rsp;
+
+    g_test_message("relocated after precond %" PRIu64 ", after loading its "
+                   "state %" PRIu64, saved, loaded);
+    g_assert_cmpuint(saved, >, 0);
+    g_assert_cmpuint(loaded, ==, saved);
+
+    cmd = g_strdup_printf("{'execute':'device_add','arguments':{"
+                          "'driver':'femu','id':'state-bad','addr':'5',"
+                          "'devsz_mb':1,'femu_mode':1,'secsz':512,"
+                          "'secs_per_pg':8,'pgs_per_blk':4,'blks_per_pl':26,"
+                          "'pls_per_lun':1,'luns_per_ch':2,'nchs':2,"
+                          "'tag_check':true,'precond_load':'%s'}}", path);
+    rsp = qtest_qmp(qts, "%p", qobject_from_json(cmd, NULL));
+    g_assert_true(qdict_haskey(rsp, "error"));
+    g_assert_nonnull(strstr(qdict_get_str(qdict_get_qdict(rsp, "error"),
+                                          "desc"), "another geometry"));
+    qobject_unref(rsp);
+    unlink(path);
+    rmdir(dir);
+}
+
+/*
+ * precond builds the state the guest's own writes would: after precond=rand:1
+ * a run of writes makes collection move exactly as many pages as after the
+ * same writes from the guest, page for page.
+ */
+static void femu_test_precond_equivalent(void *obj, void *data,
+                                         QGuestAllocator *unused)
+{
+    uint64_t precond = femu_precond_run(",precond=rand:1,precond_seed=7",
+                                        false);
+    uint64_t guest = femu_precond_run("", true);
+
+    g_test_message("relocated after precond %" PRIu64 ", after the guest's "
+                   "writes %" PRIu64, precond, guest);
+    g_assert_cmpuint(guest, >, 0);
+    g_assert_cmpuint(precond, ==, guest);
+}
+
 /* mbe_* settings a backend type does not read fail realize */
 static void femu_test_mbe_refused(void *obj, void *data,
                                   QGuestAllocator *alloc)
@@ -31450,6 +31603,15 @@ static void femu_test_mbe_refused(void *obj, void *data,
         { "'mbe_type':'none','mbe_pin_meta':false,'mbe_thp':true",
           "mbe_thp and mbe_lock need mbe_type=sparse" },
         { "'tag_check':true", "tag_check needs femu_mode=1" },
+        { "'precond':'rand:0'", "is not none, seq, rand or rand:N" },
+        { "'precond':'seq'", "precond needs femu_mode=1" },
+        { "'precond':'seq','femu_mode':1,'power_loss':true,'buffer_size':16",
+          "precond cannot be used with power_loss" },
+        { "'precond':'seq','femu_mode':1,'precond_load':'/x'",
+          "leave precond unset" },
+        { "'femu_mode':1,'precond_save':'/x'", "set precond too" },
+        { "'precond':'seq','femu_mode':1,'precond_save':'/x',"
+          "'hot_cold_sep':true", "precond_save and precond_load support" },
         { "'tag_check':true,'femu_mode':1,'mapping':'hybrid'",
           "tag_check supports mapping=page and dftl" },
         { "'tag_check':true,'femu_mode':1,'power_loss':true,'buffer_size':16",
@@ -32498,6 +32660,19 @@ static void femu_register_nodes(void)
                  &(QOSGraphTestOptions) {
         .arg = (void *)"4",
         .edge.extra_device_opts = FEMU_TAG_GEO ",subsys=fdpsub" });
+    qos_add_test("precond-rand", "femu", femu_test_precond,
+                 &(QOSGraphTestOptions) {
+        .arg = (void *)"0",
+        .edge.extra_device_opts = FEMU_TAG_GEO ",precond=rand:2" });
+    qos_add_test("precond-seq-fdp", "femu", femu_test_precond,
+                 &(QOSGraphTestOptions) {
+        .arg = (void *)"4",
+        .edge.extra_device_opts = FEMU_TAG_GEO ",precond=seq,"
+                                  "subsys=fdpsub" });
+    qos_add_test("precond-equivalent", "femu", femu_test_precond_equivalent,
+                 NULL);
+    qos_add_test("precond-save-load", "femu", femu_test_precond_save_load,
+                 NULL);
     qos_add_test("tag-inject-swallow-write", "femu", femu_test_tag_inject,
                  &(QOSGraphTestOptions) {
         .arg = (void *)"swallow-write", .edge.extra_device_opts = FEMU_TAG_GEO });

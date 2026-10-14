@@ -46,6 +46,14 @@ DEVICES = [
                 ],
             },
             {
+                "title": "Preconditioning (bbssd)",
+                "kind": "static",
+                "props": [
+                    "precond", "precond_seed", "precond_save",
+                    "precond_load",
+                ],
+            },
+            {
                 "title": "Queues, pollers and interrupts",
                 "kind": "static",
                 "props": [

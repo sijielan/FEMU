@@ -2657,6 +2657,48 @@ static bool femu_check_tag_props(FemuCtrl *n, Error **errp)
 }
 
 /*
+ * precond writes through the bbssd FTL before the guest starts. The power
+ * loss model holds the data of a buffered write, which precond has none of,
+ * and a borrowed or shared FTL belongs to another device's commands.
+ */
+static bool femu_check_precond_props(FemuCtrl *n, Error **errp)
+{
+    int passes;
+
+    if (ftl_precond_parse(n->precond, &passes, errp)) {
+        return false;
+    }
+    if (n->precond_load && passes >= 0) {
+        error_setg(errp, "femu: precond_load starts from a saved state; "
+                   "leave precond unset");
+        return false;
+    }
+    if (n->precond_save && passes < 0) {
+        error_setg(errp, "femu: precond_save keeps the state precond builds; "
+                   "set precond too");
+        return false;
+    }
+    if ((n->precond_save || n->precond_load) &&
+        !ftl_state_supported(n, errp)) {
+        return false;
+    }
+    if (passes < 0 && !n->precond_load) {
+        return true;
+    }
+    if (!BBSSD(n)) {
+        error_setg(errp, "femu: precond needs femu_mode=1 (bbssd)");
+        return false;
+    }
+    if (n->power_loss || n->cxl_dev || nvme_ns_shared(n) ||
+        n->err_write_fail_ppm) {
+        error_setg(errp, "femu: precond cannot be used with power_loss, "
+                   "cxl_ssd, shared namespaces or err_write_fail_ppm");
+        return false;
+    }
+    return true;
+}
+
+/*
  * mbe_type=none keeps no data, so only modes that keep everything else apart
  * from it can run on it: KV keys and CSD programs live in the data, an
  * Open-Channel host keeps its FTL there, and metadata, protection
@@ -2935,6 +2977,9 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
     if (!femu_check_tag_props(n, errp)) {
         return;
     }
+    if (!femu_check_precond_props(n, errp)) {
+        return;
+    }
 
     /* Format and Sanitize would rewrite the whole medium under its cache. */
     if (n->cxl_dev) {
@@ -3145,6 +3190,12 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
                sizeof(n->id_ctrl.fr));
         memcpy(n->id_ctrl.subnqn, n->subsys->subnqn,
                sizeof(n->id_ctrl.subnqn));
+    }
+
+    /* before the FTL thread exists, so nothing else touches the FTL */
+    if (bbssd_precond(n, errp)) {
+        femu_realize_undo(n);
+        return;
     }
 
     /*
@@ -3408,6 +3459,10 @@ static const Property femu_props[] = {
     DEFINE_PROP_UINT64("mbe_budget_mb", FemuCtrl, mbe_budget_mb, 0),
     DEFINE_PROP_BOOL("mbe_prefetch", FemuCtrl, mbe_prefetch, true),
     DEFINE_PROP_BOOL("tag_check", FemuCtrl, tag_check, false),
+    DEFINE_PROP_STRING("precond", FemuCtrl, precond),
+    DEFINE_PROP_UINT64("precond_seed", FemuCtrl, precond_seed, 1),
+    DEFINE_PROP_STRING("precond_save", FemuCtrl, precond_save),
+    DEFINE_PROP_STRING("precond_load", FemuCtrl, precond_load),
     DEFINE_PROP_UINT32("namespaces", FemuCtrl, num_namespaces, 1),
     DEFINE_PROP_UINT32("queues", FemuCtrl, nr_io_queues, 8),
     DEFINE_PROP_UINT32("entries", FemuCtrl, max_q_ents, 0x7ff),

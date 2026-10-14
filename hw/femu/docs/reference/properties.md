@@ -22,7 +22,7 @@ Devices:
 
 ## `femu`: NVMe controller
 
-`-device femu` has 194 properties of its own and 6 QOM properties listed in [runtime-properties.md](runtime-properties.md).
+`-device femu` has 198 properties of its own and 6 QOM properties listed in [runtime-properties.md](runtime-properties.md).
 
 ### Mode, capacity and namespaces
 
@@ -56,6 +56,15 @@ Devices:
 | Property | Type | Default | Description |
 | --- | --- | --- | --- |
 | `tag_check` | `bool` | `off` | bbssd: keep a tag (logical page, version) with each NAND page and check every read against the versions NVMe allows, catching mapping, collection and deallocate bugs the data does not show; mapping=page or dftl, not with power_loss; off by default |
+
+### Preconditioning (bbssd)
+
+| Property | Type | Default | Description |
+| --- | --- | --- | --- |
+| `precond` | `str` | unset | bbssd: write every namespace at realize through the FTL, untimed, before the guest starts: seq fills it in order, rand:N then writes N times its capacity to random pages (N 1 to 100); block content is undefined after it; none (default) writes nothing |
+| `precond_seed` | `uint64` | `1` | Seed of the random page order precond=rand uses; the same seed and geometry give the same FTL state |
+| `precond_save` | `str` | unset | Host file to keep the FTL state precond built in, for precond_load to start from; page or dftl mapping without FDP, streams, hot_cold_sep, gc_pace or blk_pe_limit |
+| `precond_load` | `str` | unset | Host file a precond_save run wrote: start every bbssd namespace from that FTL state instead of running precond; geometry, size, LBA format, mapping and tag_check must match |
 
 ### Queues, pollers and interrupts
 

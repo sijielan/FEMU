@@ -2421,6 +2421,10 @@ typedef struct FemuCtrl {
     uint64_t        mbe_budget_mb;
     bool            mbe_prefetch;
     bool            tag_check;  /* check bbssd reads against FTL tags */
+    char            *precond;   /* bbssd state to write at realize */
+    uint64_t        precond_seed;
+    char            *precond_save;  /* file to keep that state in */
+    char            *precond_load;  /* file to start from instead */
     int             tag_inject; /* qtest: FTL_TAG_INJECT_* to fire once */
     FemuMbeConfig   mbe_cfg;    /* the above, parsed at realize */
     uint32_t        read_cache_mb; /* bbssd DRAM read cache size (0 = off) */
@@ -2893,6 +2897,7 @@ void bbssd_tag_complete(FemuCtrl *n, NvmeRequest *req);
 void bbssd_tag_release(NvmeRequest *req);
 void bbssd_tag_stats(FemuCtrl *n, uint64_t *checked, uint64_t *errors,
                      uint64_t *skipped, uint64_t *injected);
+int bbssd_precond(FemuCtrl *n, Error **errp);
 
 static inline void nvme_req_release_ranges(NvmeRequest *req)
 {
