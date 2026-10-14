@@ -87,10 +87,11 @@ static const FemuPropDesc femu_ctrl_descs[] = {
       "only blocks never written or deallocated cost no memory; needs "
       "RLIMIT_MEMLOCK unlimited" },
     { "mbe_pin_meta",
-      "mbe_type=sparse or file: pin all process memory other than the "
+      "mbe_type=sparse, file or none: pin all process memory other than the "
       "backend data as it is touched (mlockall), so FTL metadata and FEMU "
-      "threads never page out; needs RLIMIT_MEMLOCK unlimited, off only for "
-      "unprivileged runs" },
+      "threads never page out. Pinning needs RLIMIT_MEMLOCK unlimited or "
+      "CAP_IPC_LOCK: auto (default) pins when it can and otherwise warns and "
+      "runs unpinned, on fails realize instead, off never pins" },
     { "mbe_budget_mb",
       "mbe_type=sparse or file: MiB of backend data to keep in host memory; "
       "a background thread evicts the least recently used 2 MiB chunks "

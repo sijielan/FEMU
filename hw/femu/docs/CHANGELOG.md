@@ -39,7 +39,7 @@ listed one by one.
 
 #### Running with less host DRAM
 
-- The memory backend no longer has to hold the whole device in pinned DRAM. `mbe_type=sparse` takes host memory only for the blocks written, `mbe_type=file` maps `mbe_file` so the page cache holds the data, and `mbe_type=none` keeps no data; Deallocate, Format, Sanitize and namespace creation give pages back instead of faulting them in. `mbe_pin_meta` pins the rest of the process so only data is reclaimed, and `mbe-resident` reports what is in memory (b374b08a5, 3ff2020eb).
+- The memory backend no longer has to hold the whole device in pinned DRAM. `mbe_type=sparse` takes host memory only for the blocks written, `mbe_type=file` maps `mbe_file` so the page cache holds the data, and `mbe_type=none` keeps no data; Deallocate, Format, Sanitize and namespace creation give pages back instead of faulting them in. `mbe_pin_meta` pins the rest of the process so only data is reclaimed (by default only when the memlock limit allows, so a user without it still runs), and `mbe-resident` reports what is in memory (b374b08a5, 3ff2020eb).
 - `mbe_budget_mb` keeps a sparse or file backend's data within a budget from a thread of its own, and `mbe_prefetch` reads ahead the data of the reads waiting in a queue (e8bef44b6).
 - `tag_check` keeps a tag with each NAND page and checks every read against the versions NVMe allows, catching mapping, collection and deallocate bugs that FEMU's LBA-addressed data cannot show; `x-tag-inject` proves it under qtest (b61cf1039).
 - `precond=seq|rand:N` brings bbssd namespaces to steady state at realize through the FTL's own path, untimed, and `precond_save`/`precond_load` keep that state, FDP reclaim units included (17ecd5d18, 0c7bcb0bc).

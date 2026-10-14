@@ -2792,7 +2792,8 @@ static bool femu_check_mbe_props(FemuCtrl *n, Error **errp)
     cfg->budget = n->mbe_budget_mb * MiB;
     cfg->prefetch = n->mbe_prefetch;
     if (cfg->type == FEMU_MBE_DRAM) {
-        if (n->mbe_file || n->mbe_thp || n->mbe_lock || !n->mbe_pin_meta ||
+        if (n->mbe_file || n->mbe_thp || n->mbe_lock ||
+            n->mbe_pin_meta != ON_OFF_AUTO_AUTO ||
             n->mbe_budget_mb || !n->mbe_prefetch) {
             error_setg(errp, "femu: mbe_file, mbe_thp, mbe_lock, "
                        "mbe_pin_meta, mbe_budget_mb and mbe_prefetch need "
@@ -2822,11 +2823,6 @@ static bool femu_check_mbe_props(FemuCtrl *n, Error **errp)
     if (cfg->type != FEMU_MBE_SPARSE && (n->mbe_thp || n->mbe_lock)) {
         error_setg(errp, "femu: mbe_thp and mbe_lock need mbe_type=sparse");
         return false;
-    }
-    if (!n->mbe_pin_meta) {
-        warn_report("femu: mbe_pin_meta=off: the host may page out FTL "
-                    "metadata and FEMU threads, and the faults show up as "
-                    "late completions");
     }
     return true;
 }
@@ -3490,7 +3486,8 @@ static const Property femu_props[] = {
     DEFINE_PROP_STRING("mbe_file", FemuCtrl, mbe_file),
     DEFINE_PROP_BOOL("mbe_thp", FemuCtrl, mbe_thp, false),
     DEFINE_PROP_BOOL("mbe_lock", FemuCtrl, mbe_lock, false),
-    DEFINE_PROP_BOOL("mbe_pin_meta", FemuCtrl, mbe_pin_meta, true),
+    DEFINE_PROP_ON_OFF_AUTO("mbe_pin_meta", FemuCtrl, mbe_pin_meta,
+                            ON_OFF_AUTO_AUTO),
     DEFINE_PROP_UINT64("mbe_budget_mb", FemuCtrl, mbe_budget_mb, 0),
     DEFINE_PROP_BOOL("mbe_prefetch", FemuCtrl, mbe_prefetch, true),
     DEFINE_PROP_BOOL("tag_check", FemuCtrl, tag_check, false),

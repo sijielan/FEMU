@@ -43,7 +43,7 @@ typedef struct FemuMbeConfig {
     const char *file;   /* FILE: the host file holding the data */
     bool thp;           /* SPARSE: let the host back it with huge pages */
     bool lock;          /* SPARSE: keep pages resident once written */
-    bool pin_meta;      /* SPARSE/FILE: pin all other process memory */
+    OnOffAuto pin_meta; /* SPARSE/FILE/NONE: pin all other process memory */
     uint64_t budget;    /* SPARSE/FILE: resident bytes to evict down to */
     bool prefetch;      /* SPARSE/FILE: read ahead what a sweep will read */
 } FemuMbeConfig;

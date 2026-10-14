@@ -2437,7 +2437,7 @@ typedef struct FemuCtrl {
     char            *mbe_file;
     bool            mbe_thp;
     bool            mbe_lock;
-    bool            mbe_pin_meta;
+    OnOffAuto       mbe_pin_meta;
     uint64_t        mbe_budget_mb;
     bool            mbe_prefetch;
     bool            tag_check;  /* check bbssd reads against FTL tags */

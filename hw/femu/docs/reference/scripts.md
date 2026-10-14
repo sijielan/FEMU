@@ -202,9 +202,9 @@ For a memory backend that does not hold the whole device in DRAM
 
 | Script | What it does |
 | --- | --- |
-| `lessdram-host.sh check` | Reports zswap parameters, swap devices, THP, `RLIMIT_MEMLOCK` (which `mbe_pin_meta=on` needs unlimited) and the cgroup v2 memory files. |
+| `lessdram-host.sh check` | Reports zswap parameters, swap devices, THP, `RLIMIT_MEMLOCK` (which `mbe_pin_meta` needs unlimited to pin; under a lower limit `auto` runs unpinned) and the cgroup v2 memory files. |
 | `lessdram-host.sh zswap-on [COMPRESSOR [ZPOOL [PERCENT]]]` | As root: turns zswap on, by default with `lz4`, `zsmalloc` and a 20% pool. Not persistent. |
-| `lessdram-host.sh run [--mem-max SIZE] [--swap-max SIZE] [--zswap-max SIZE] [--user] -- CMD...` | Runs CMD (QEMU) in a transient systemd scope with `memory.max`, `memory.swap.max` and `memory.zswap.max`, so the host keeps hot backend data in DRAM and moves the rest to zswap and swap. `--user` needs no root but cannot lift `RLIMIT_MEMLOCK`: use `mbe_pin_meta=off` there. Also works as `QTEST_QEMU_BINARY="lessdram-host.sh run --user --mem-max 80M -- ./qemu-system-x86_64"`. |
+| `lessdram-host.sh run [--mem-max SIZE] [--swap-max SIZE] [--zswap-max SIZE] [--user] -- CMD...` | Runs CMD (QEMU) in a transient systemd scope with `memory.max`, `memory.swap.max` and `memory.zswap.max`, so the host keeps hot backend data in DRAM and moves the rest to zswap and swap. `--user` needs no root; under the user's memlock limit the default `mbe_pin_meta=auto` runs unpinned with a warning. Also works as `QTEST_QEMU_BINARY="lessdram-host.sh run --user --mem-max 80M -- ./qemu-system-x86_64"`. |
 | `lessdram-compress-ratio.py IMAGE [--sample N]` | Reads a disk image in 4 KiB pages and reports the share of zero and same-filled pages and the compression ratio of the rest (lz4 when the Python module is installed, else zlib level 1), to judge whether a zswap tier would hold much more than DRAM. |
 
 ## Documentation tooling

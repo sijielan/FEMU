@@ -20,14 +20,16 @@
 #       Run QEMU in a transient systemd scope with memory.max SIZE (a memory
 #       limit the host reclaims to, which pushes backend data to zswap and
 #       swap), memory.swap.max and memory.zswap.max. --user uses the user's
-#       systemd instance, which needs no root but cannot raise
-#       RLIMIT_MEMLOCK: run QEMU with mbe_pin_meta=off there, or as root.
+#       systemd instance, which needs no root. Under the user's memlock
+#       limit mbe_pin_meta=auto (the default) runs unpinned with a warning.
 #
 # Leave room under --mem-max for what never leaves DRAM: guest memory
 # (unless it is on hugetlbfs, which the cgroup does not reclaim), the FTL
 # metadata (about 0.5% of the device, more with tag_check) and QEMU itself.
-# With mbe_pin_meta=on everything but the backend data is locked, and
-# locked memory counts against memory.max too.
+# When mbe_pin_meta pins, everything but the backend data is locked, and
+# locked memory counts against memory.max too. Pinning needs RLIMIT_MEMLOCK
+# unlimited: once, as root, add "USER - memlock unlimited" to
+# /etc/security/limits.conf, or setcap cap_ipc_lock+ep on qemu-system-x86_64.
 
 set -euo pipefail
 
@@ -70,7 +72,9 @@ cmd_check() {
     memlock=$(ulimit -l)
     echo "  RLIMIT_MEMLOCK: $memlock (KiB)"
     if [ "$memlock" != "unlimited" ] && [ "$(id -u)" != 0 ]; then
-        echo "  mbe_pin_meta=on needs unlimited or root; use mbe_pin_meta=off"
+        echo "  too low to pin: mbe_pin_meta=auto runs unpinned with a warning;"
+        echo "  to pin, set memlock unlimited in /etc/security/limits.conf"
+        echo "  or setcap cap_ipc_lock+ep on qemu-system-x86_64 (once, as root)"
     fi
 
     echo "== cgroup v2"

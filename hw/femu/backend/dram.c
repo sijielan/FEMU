@@ -3,6 +3,7 @@
 #include <sys/statvfs.h>
 #include "../nvme.h"
 #include "qemu/madvise.h"
+#include "qemu/error-report.h"
 
 /* Coperd: FEMU Memory Backend (mbe) for emulated SSD */
 
@@ -114,22 +115,43 @@ static int mbe_check_memlock(const char *what, Error **errp)
  * this. MCL_ONFAULT pins a page when it is first touched, not at once, which
  * would fault in all of guest memory and every mapping made later. Once per
  * process, since a second MCL_CURRENT would pin the data mapped since.
+ *
+ * Pinning needs RLIMIT_MEMLOCK unlimited or CAP_IPC_LOCK, which a user
+ * rarely has. With mbe_pin_meta=auto, the default, a process that cannot
+ * pin says what that costs and runs unpinned, as FEMU does when it cannot
+ * pin a dram backend: the data stays right, only faults on the metadata may
+ * show up as late completions. mbe_pin_meta=on refuses to run unpinned.
  */
-static int mbe_pin_process(Error **errp)
+static int mbe_pin_process(OnOffAuto mode, Error **errp)
 {
-    static bool pinned;
+    static bool pinned, warned;
+    Error *err = NULL;
 
-    if (pinned) {
+    if (pinned || mode == ON_OFF_AUTO_OFF) {
         return 0;
     }
-    if (mbe_check_memlock("mbe_pin_meta", errp)) {
+    if (!mbe_check_memlock("mbe_pin_meta", &err)) {
+        if (!mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT)) {
+            pinned = true;
+            return 0;
+        }
+        error_setg_errno(&err, errno, "femu: mbe_pin_meta: mlockall failed");
+    }
+    if (mode == ON_OFF_AUTO_ON) {
+        error_propagate(errp, err);
         return -1;
     }
-    if (mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT)) {
-        error_setg_errno(errp, errno, "femu: mbe_pin_meta: mlockall failed");
-        return -1;
+    if (!warned) {
+        warn_report_err(err);
+        warn_report("femu: running with FTL metadata and FEMU threads "
+                    "unpinned: if the host pages them out, the faults show "
+                    "up as late completions. Raise the memlock limit "
+                    "(limits.conf memlock unlimited, or setcap cap_ipc_lock) "
+                    "to pin them, or set mbe_pin_meta=off to silence this");
+        warned = true;
+    } else {
+        error_free(err);
     }
-    pinned = true;
     return 0;
 }
 
@@ -457,7 +479,7 @@ int init_dram_backend(SsdDramBackend **mbe, int64_t nbytes,
         return 0;
     }
 
-    if (cfg->pin_meta && mbe_pin_process(errp)) {
+    if (mbe_pin_process(cfg->pin_meta, errp)) {
         return -1;
     }
     if (cfg->type == FEMU_MBE_NONE) {

@@ -10,6 +10,7 @@
  */
 
 #include "qemu/osdep.h"
+#include <sys/resource.h>
 #include "qemu/module.h"
 #include "libqtest.h"
 #include "qobject/qdict.h"
@@ -31907,6 +31908,60 @@ static void femu_test_geometry_2t(void *obj, void *data, QGuestAllocator *unused
     qtest_pc_shutdown(qs);
 }
 
+/*
+ * A user without the memlock limit pinning needs still runs a sparse
+ * backend by default: mbe_pin_meta=auto warns and runs unpinned. With
+ * mbe_pin_meta=on the controller pins or refuses to start, whichever the
+ * limit allows.
+ */
+static void femu_test_mbe_pin_auto(void *obj, void *data,
+                                   QGuestAllocator *alloc)
+{
+    QFemu *femu = obj;
+    QTestState *qts = femu->dev.bus->qts;
+    struct rlimit rl;
+    bool can_pin = geteuid() == 0 ||
+                   (!getrlimit(RLIMIT_MEMLOCK, &rl) &&
+                    rl.rlim_cur == RLIM_INFINITY);
+    QOSState *qs = qtest_pc_boot("-machine pc -nodefaults -device femu,"
+                                 "id=mbe,addr=5,devsz_mb=64,femu_mode=2,"
+                                 "mbe_type=sparse");
+    QPCIDevice *pdev = qpci_device_find(qs->pcibus, QPCI_DEVFN(5, 0));
+    FemuCtrlState c = { 0 };
+    uint64_t buf = guest_alloc(&qs->alloc, 4096);
+    uint8_t got[FEMU_DATA_SIZE];
+    QDict *rsp;
+
+    femu_enable(&c, pdev, &qs->alloc);
+    femu_create_io_queues(&c);
+    qtest_memset(qs->qts, buf, 0x6b, FEMU_DATA_SIZE);
+    g_assert_cmphex(femu_rw(&c, NVME_CMD_WRITE, 0, buf), ==, NVME_SUCCESS);
+    qtest_memset(qs->qts, buf, 0, FEMU_DATA_SIZE);
+    g_assert_cmphex(femu_rw(&c, NVME_CMD_READ, 0, buf), ==, NVME_SUCCESS);
+    qtest_memread(qs->qts, buf, got, sizeof(got));
+    g_assert_cmpint(got[0], ==, 0x6b);
+    g_assert_cmpint(got[sizeof(got) - 1], ==, 0x6b);
+    femu_disable(&c);
+    guest_free(&qs->alloc, buf);
+    g_free(pdev);
+    qtest_pc_shutdown(qs);
+
+    rsp = qtest_qmp(qts, "{'execute':'device_add','arguments':{"
+                    "'driver':'femu','id':'pin-on','addr':'5',"
+                    "'devsz_mb':8,'femu_mode':2,'mbe_type':'sparse',"
+                    "'mbe_pin_meta':'on'}}");
+    if (can_pin) {
+        g_assert_false(qdict_haskey(rsp, "error"));
+        qobject_unref(rsp);
+        qos_invalidate_command_line();
+        return;
+    }
+    g_assert_true(qdict_haskey(rsp, "error"));
+    g_assert_nonnull(strstr(qdict_get_str(qdict_get_qdict(rsp, "error"),
+                                          "desc"), "RLIMIT_MEMLOCK"));
+    qobject_unref(rsp);
+}
+
 /* mbe_* settings a backend type does not read fail realize */
 static void femu_test_mbe_refused(void *obj, void *data,
                                   QGuestAllocator *alloc)
@@ -31916,30 +31971,30 @@ static void femu_test_mbe_refused(void *obj, void *data,
     static const char *const opts[][2] = {
         { "'mbe_type':'flash'", "mbe_type=flash is not one of" },
         { "'mbe_thp':true", "need mbe_type=sparse or file" },
-        { "'mbe_pin_meta':false", "need mbe_type=sparse or file" },
+        { "'mbe_pin_meta':'off'", "need mbe_type=sparse or file" },
         { "'mbe_file':'/nonexistent/x'", "need mbe_type=sparse or file" },
         { "'mbe_budget_mb':8", "need mbe_type=sparse or file" },
         { "'mbe_prefetch':false", "need mbe_type=sparse or file" },
-        { "'mbe_type':'sparse','mbe_pin_meta':false,'mbe_lock':true,"
+        { "'mbe_type':'sparse','mbe_pin_meta':'off','mbe_lock':true,"
           "'mbe_budget_mb':8", "leaves mbe_budget_mb nothing to evict" },
-        { "'mbe_type':'file','mbe_pin_meta':false", "mbe_file is required" },
-        { "'mbe_type':'sparse','mbe_pin_meta':false,"
+        { "'mbe_type':'file','mbe_pin_meta':'off'", "mbe_file is required" },
+        { "'mbe_type':'sparse','mbe_pin_meta':'off',"
           "'mbe_file':'/nonexistent/x'", "mbe_file is not used" },
-        { "'mbe_type':'file','mbe_pin_meta':false,'mbe_lock':true,"
+        { "'mbe_type':'file','mbe_pin_meta':'off','mbe_lock':true,"
           "'mbe_file':'/nonexistent/x'", "need mbe_type=sparse" },
-        { "'mbe_type':'file','mbe_pin_meta':false,"
+        { "'mbe_type':'file','mbe_pin_meta':'off',"
           "'mbe_file':'/nonexistent/x'", "/nonexistent/x" },
-        { "'mbe_type':'none','mbe_pin_meta':false,'femu_mode':5",
+        { "'mbe_type':'none','mbe_pin_meta':'off','femu_mode':5",
           "supports bbssd, NoSSD and ZNS only" },
-        { "'mbe_type':'none','mbe_pin_meta':false,'femu_mode':0",
+        { "'mbe_type':'none','mbe_pin_meta':'off','femu_mode':0",
           "supports bbssd, NoSSD and ZNS only" },
-        { "'mbe_type':'none','mbe_pin_meta':false,'meta':8,'mc':3",
+        { "'mbe_type':'none','mbe_pin_meta':'off','meta':8,'mc':3",
           "leave meta, pi, extended and power_loss unset" },
-        { "'mbe_type':'none','mbe_pin_meta':false,'pi':true",
+        { "'mbe_type':'none','mbe_pin_meta':'off','pi':true",
           "leave meta, pi, extended and power_loss unset" },
-        { "'mbe_type':'none','mbe_pin_meta':false,'mbe_budget_mb':4",
+        { "'mbe_type':'none','mbe_pin_meta':'off','mbe_budget_mb':4",
           "mbe_budget_mb and mbe_prefetch need" },
-        { "'mbe_type':'none','mbe_pin_meta':false,'mbe_thp':true",
+        { "'mbe_type':'none','mbe_pin_meta':'off','mbe_thp':true",
           "mbe_thp and mbe_lock need mbe_type=sparse" },
         { "'tag_check':true", "tag_check needs femu_mode=1" },
         { "'async_copy':2", "async_copy needs bbssd, or NoSSD with "
@@ -32984,6 +33039,7 @@ static void femu_register_nodes(void)
     qos_add_test("mbe-file", "femu", femu_test_mbe_lazy,
                  &(QOSGraphTestOptions) { .arg = (void *)"file" });
     qos_add_test("mbe-refused", "femu", femu_test_mbe_refused, NULL);
+    qos_add_test("mbe-pin-auto", "femu", femu_test_mbe_pin_auto, NULL);
 #define FEMU_TAG_GEO "id=mbe,tag_check=on,devsz_mb=1,femu_mode=1,secsz=512," \
     "secs_per_pg=8,pgs_per_blk=4,blks_per_pl=25,pls_per_lun=1,luns_per_ch=2," \
     "nchs=2"
