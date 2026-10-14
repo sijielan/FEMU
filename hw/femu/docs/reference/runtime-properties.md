@@ -32,6 +32,14 @@ or in the HMP monitor with `qom-get` and `qom-set`. Event counters are cleared b
 | `mbe-resident` | `uint64` | Read-only: bytes of the memory backend now in host memory; for mbe_type=file, the pages of mbe_file in the page cache |
 | `mbe-evicted` | `uint64` | Read-only: bytes of backend data the mbe_budget_mb thread has taken out of host memory since realize |
 
+### FTL tag checker results
+
+| Property | Type | Description |
+| --- | --- | --- |
+| `tag-checked` | `uint64` | Read-only: logical pages tag_check has checked on read |
+| `tag-errors` | `uint64` | Read-only: reads tag_check found wrong; the first are logged with their logical and physical page |
+| `tag-skipped` | `uint64` | Read-only: logical pages read that tag_check could not check, as their last change was a Copy or failed |
+
 ## `femu-cxl-ssd`: CXL Type-3 SSD
 
 ### Cache tunables (also accepted on -device)

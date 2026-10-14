@@ -321,6 +321,9 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
          * append, feature get) overwrite it explicitly.
          */
         req->cqe.res64 = 0;
+        if (unlikely(req->tag)) {
+            bbssd_tag_release(req);
+        }
         req->ns = NULL;
         req->xfer_bytes = 0;
         req->dsm_ranges = NULL;
@@ -365,6 +368,10 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
             }
         }
         req->status = status;
+        if (unlikely(n->tag_check) && status == NVME_SUCCESS && req->ns &&
+            NS_BBSSD(req->ns) && req->ns->ssd) {
+            bbssd_tag_fetch(n, req);
+        }
 
         /*
          * Host I/O totals for the SMART health log, counted here so every mode
@@ -778,6 +785,9 @@ static void nvme_process_cq_cpl(void *arg, int index_poller)
         }
 
         pqueue_pop(pq);
+        if (req->tag) {
+            bbssd_tag_complete(n, req);
+        }
         /*
          * A submission queue names the completion queue it reports to, and the
          * two need not share a number. Indexing by the submission queue's own

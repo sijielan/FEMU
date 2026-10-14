@@ -31218,6 +31218,203 @@ static void femu_test_mbe_none(void *obj, void *data, QGuestAllocator *unused)
     qtest_pc_shutdown(qs);
 }
 
+/* one 4 KiB page from @page, read on namespace 1 */
+static uint16_t femu_tag_read(FemuCtrlState *c, uint64_t page, uint64_t buf)
+{
+    return FEMU_SC(femu_rw(c, NVME_CMD_READ, page * (4096 / c->lba_size),
+                           buf));
+}
+
+/*
+ * Random writes of one to four pages, placed on a random handle when @nruh
+ * is set, single page reads and deallocates over @pages pages, then a read
+ * of every page.
+ */
+static void femu_tag_workload(FemuCtrlState *c, uint64_t buf, uint64_t list,
+                              uint32_t pages, int nruh, int iters,
+                              uint32_t *seed)
+{
+    for (int i = 0; i < iters; i++) {
+        uint32_t r, page, npages;
+
+        *seed = *seed * 1103515245 + 12345;
+        r = *seed >> 8;
+        npages = 1 + (r >> 4) % 4;
+        page = (r >> 8) % (pages - npages + 1);
+        switch (r % 10) {
+        case 0 ... 5:
+            g_assert_cmphex(FEMU_SC(femu_write_pages_placed(c, page, npages,
+                                                            buf, list,
+                                                            nruh ? (int)(r >> 2) % nruh : -1)),
+                            ==, NVME_SUCCESS);
+            break;
+        case 6 ... 8:
+            g_assert_cmphex(femu_tag_read(c, page, buf), ==, NVME_SUCCESS);
+            break;
+        default:
+            g_assert_cmphex(femu_dealloc_pages(c, page, npages, list), ==,
+                            NVME_SUCCESS);
+            break;
+        }
+    }
+    for (uint32_t page = 0; page < pages; page++) {
+        g_assert_cmphex(femu_tag_read(c, page, buf), ==, NVME_SUCCESS);
+    }
+}
+
+/*
+ * Queue FEMU_QSIZE - 1 commands at once, writes, reads and deallocates of
+ * one page among the first eight, so several writes to a page are in flight
+ * together and reads overlap them, then wait for them all.
+ */
+static void femu_tag_burst(FemuCtrlState *c, uint64_t buf, uint64_t list,
+                           uint32_t *seed)
+{
+    QTestState *qts = c->pdev->bus->qts;
+    const uint32_t n = FEMU_QSIZE - 1;
+    uint32_t stride = 4096 / c->lba_size;
+    uint8_t range[16] = { 0 };
+
+    stl_le_p(range + 4, stride);
+    for (uint32_t k = 0; k < n; k++) {
+        NvmeRwCmd rw = { 0 };
+        uint32_t r, page;
+
+        *seed = *seed * 1103515245 + 12345;
+        r = *seed >> 8;
+        page = (r >> 4) % 8;
+        rw.cid = cpu_to_le16(c->cid++);
+        rw.nsid = cpu_to_le32(1);
+        rw.dptr.prp1 = cpu_to_le64(buf);
+        switch (r % 8) {
+        case 0 ... 3:
+            rw.opcode = NVME_CMD_WRITE;
+            break;
+        case 4 ... 6:
+            rw.opcode = NVME_CMD_READ;
+            break;
+        default:
+            /* one range per command, in its own slot of the list page */
+            stq_le_p(range + 8, (uint64_t)page * stride);
+            qtest_memwrite(qts, list + k * 16, range, sizeof(range));
+            rw.opcode = NVME_CMD_DSM;
+            rw.dptr.prp1 = cpu_to_le64(list + k * 16);
+            ((NvmeCmd *)&rw)->cdw11 = cpu_to_le32(FEMU_DSM_AD);
+            break;
+        }
+        if (rw.opcode != NVME_CMD_DSM) {
+            rw.slba = cpu_to_le64((uint64_t)page * stride);
+            rw.nlb = cpu_to_le16(stride - 1);
+        }
+        qtest_memwrite(qts, c->io.sq_addr + c->io.sq_tail * sizeof(NvmeCmd),
+                       &rw, sizeof(rw));
+        c->io.sq_tail = (c->io.sq_tail + 1) % FEMU_QSIZE;
+    }
+    qpci_io_writel(c->pdev, c->bar, femu_sq_doorbell(c, c->io.qid),
+                   c->io.sq_tail);
+    for (uint32_t k = 0; k < n; k++) {
+        g_assert_cmphex(FEMU_SC(femu_complete(c, &c->io, NULL, NULL)), ==,
+                        NVME_SUCCESS);
+    }
+}
+
+/*
+ * A correct FTL passes tag_check: random writes, reads and deallocates,
+ * several times the device's capacity so collection runs, find no read
+ * wrong. @data is the number of FDP handles to place writes on, as a string.
+ */
+static void femu_test_tag_clean(void *obj, void *data, QGuestAllocator *alloc)
+{
+    QFemu *femu = obj;
+    QTestState *qts = femu->dev.bus->qts;
+    FemuCtrlState c = { 0 };
+    const uint32_t pages = 256;
+    int nruh = atoi(data);
+    uint64_t buf = guest_alloc(alloc, 4096);
+    uint64_t list = guest_alloc(alloc, 4096);
+    uint32_t seed = 11;
+
+    femu_enable(&c, &femu->dev, alloc);
+    femu_create_io_queues(&c);
+    qtest_memset(qts, buf, 0x3c, 4096);
+    femu_tag_workload(&c, buf, list, pages, nruh, 3000, &seed);
+    for (int i = 0; i < 100; i++) {
+        femu_tag_burst(&c, buf, list, &seed);
+    }
+    /* a format deallocates every page; reads after it expect that */
+    g_assert_cmphex(FEMU_SC(femu_format(&c, 1, 0, 0)), ==, NVME_SUCCESS);
+    femu_tag_workload(&c, buf, list, pages, nruh, 500, &seed);
+    g_test_message("checked %" PRIu64 ", skipped %" PRIu64 ", errors %"
+                   PRIu64 ", collected %" PRIu64 " pages",
+                   femu_mbe_get(qts, "tag-checked"),
+                   femu_mbe_get(qts, "tag-skipped"),
+                   femu_mbe_get(qts, "tag-errors"), femu_gc_pages(&c, list));
+    g_assert_cmpuint(femu_mbe_get(qts, "tag-errors"), ==, 0);
+    g_assert_cmpuint(femu_mbe_get(qts, "tag-checked"), >=, pages);
+    g_assert_cmpuint(femu_gc_pages(&c, list), >, 0);
+
+    guest_free(alloc, list);
+    guest_free(alloc, buf);
+    femu_disable(&c);
+    /* the counters are cumulative; the next test needs a fresh device */
+    qos_invalidate_command_line();
+}
+
+/*
+ * Each fault injected into the FTL is caught by the next read of the page it
+ * broke. @data names the injection point.
+ */
+static void femu_test_tag_inject(void *obj, void *data, QGuestAllocator *alloc)
+{
+    QFemu *femu = obj;
+    QTestState *qts = femu->dev.bus->qts;
+    FemuCtrlState c = { 0 };
+    const char *point = data;
+    const uint32_t pages = 256;
+    uint64_t buf = guest_alloc(alloc, 4096);
+    uint64_t list = guest_alloc(alloc, 4096);
+    uint32_t seed = 5;
+
+    femu_enable(&c, &femu->dev, alloc);
+    femu_create_io_queues(&c);
+    qtest_memset(qts, buf, 0x3c, 4096);
+    for (uint32_t page = 0; page < pages; page += 64) {
+        g_assert_cmphex(FEMU_SC(femu_write_pages_placed(&c, page, 64, buf,
+                                                        list, -1)),
+                        ==, NVME_SUCCESS);
+    }
+    g_assert_cmpuint(femu_mbe_get(qts, "tag-errors"), ==, 0);
+    qtest_qmp_assert_success(qts, "{'execute':'qom-set','arguments':{"
+                             "'path':'/machine/peripheral/mbe',"
+                             "'property':'x-tag-inject','value':%s}}",
+                             point);
+    if (!strcmp(point, "trim-keep")) {
+        g_assert_cmphex(femu_dealloc_pages(&c, 5, 1, list), ==, NVME_SUCCESS);
+    } else if (!strcmp(point, "gc-stale-map")) {
+        for (int i = 0; i < 100 && !femu_mbe_get(qts, "x-tag-injected");
+             i++) {
+            femu_tag_workload(&c, buf, list, pages, 0, 50, &seed);
+        }
+    } else {
+        g_assert_cmphex(FEMU_SC(femu_write_pages_placed(&c, 5, 1, buf, list,
+                                                        -1)),
+                        ==, NVME_SUCCESS);
+    }
+    g_assert_cmpuint(femu_mbe_get(qts, "x-tag-injected"), ==, 1);
+    for (uint32_t page = 0; page < pages; page++) {
+        g_assert_cmphex(femu_tag_read(&c, page, buf), ==, NVME_SUCCESS);
+    }
+    g_test_message("%s: %" PRIu64 " errors", point,
+                   femu_mbe_get(qts, "tag-errors"));
+    g_assert_cmpuint(femu_mbe_get(qts, "tag-errors"), >=, 1);
+
+    guest_free(alloc, list);
+    guest_free(alloc, buf);
+    femu_disable(&c);
+    /* the FTL now holds the fault, and the counters keep the errors */
+    qos_invalidate_command_line();
+}
+
 /* mbe_* settings a backend type does not read fail realize */
 static void femu_test_mbe_refused(void *obj, void *data,
                                   QGuestAllocator *alloc)
@@ -31252,6 +31449,11 @@ static void femu_test_mbe_refused(void *obj, void *data,
           "mbe_budget_mb and mbe_prefetch need" },
         { "'mbe_type':'none','mbe_pin_meta':false,'mbe_thp':true",
           "mbe_thp and mbe_lock need mbe_type=sparse" },
+        { "'tag_check':true", "tag_check needs femu_mode=1" },
+        { "'tag_check':true,'femu_mode':1,'mapping':'hybrid'",
+          "tag_check supports mapping=page and dftl" },
+        { "'tag_check':true,'femu_mode':1,'power_loss':true,'buffer_size':16",
+          "tag_check cannot follow pages" },
     };
     QDict *rsp;
 
@@ -32276,6 +32478,38 @@ static void femu_register_nodes(void)
     qos_add_test("mbe-file", "femu", femu_test_mbe_lazy,
                  &(QOSGraphTestOptions) { .arg = (void *)"file" });
     qos_add_test("mbe-refused", "femu", femu_test_mbe_refused, NULL);
+#define FEMU_TAG_GEO "id=mbe,tag_check=on,devsz_mb=1,femu_mode=1,secsz=512," \
+    "secs_per_pg=8,pgs_per_blk=4,blks_per_pl=25,pls_per_lun=1,luns_per_ch=2," \
+    "nchs=2"
+    qos_add_test("tag-clean", "femu", femu_test_tag_clean,
+                 &(QOSGraphTestOptions) {
+        .arg = (void *)"0", .edge.extra_device_opts = FEMU_TAG_GEO });
+    qos_add_test("tag-clean-buffer", "femu", femu_test_tag_clean,
+                 &(QOSGraphTestOptions) {
+        .arg = (void *)"0",
+        .edge.extra_device_opts = FEMU_TAG_GEO ",buffer_size=8" });
+    qos_add_test("tag-clean-dftl-none", "femu", femu_test_tag_clean,
+                 &(QOSGraphTestOptions) {
+        .arg = (void *)"0",
+        .edge.extra_device_opts = FEMU_TAG_GEO ",mapping=dftl,"
+                                  "mapping_cache_mb=1,mbe_type=none,"
+                                  "mbe_pin_meta=off" });
+    qos_add_test("tag-clean-fdp", "femu", femu_test_tag_clean,
+                 &(QOSGraphTestOptions) {
+        .arg = (void *)"4",
+        .edge.extra_device_opts = FEMU_TAG_GEO ",subsys=fdpsub" });
+    qos_add_test("tag-inject-swallow-write", "femu", femu_test_tag_inject,
+                 &(QOSGraphTestOptions) {
+        .arg = (void *)"swallow-write", .edge.extra_device_opts = FEMU_TAG_GEO });
+    qos_add_test("tag-inject-map-neighbor", "femu", femu_test_tag_inject,
+                 &(QOSGraphTestOptions) {
+        .arg = (void *)"map-neighbor", .edge.extra_device_opts = FEMU_TAG_GEO });
+    qos_add_test("tag-inject-trim-keep", "femu", femu_test_tag_inject,
+                 &(QOSGraphTestOptions) {
+        .arg = (void *)"trim-keep", .edge.extra_device_opts = FEMU_TAG_GEO });
+    qos_add_test("tag-inject-gc-stale-map", "femu", femu_test_tag_inject,
+                 &(QOSGraphTestOptions) {
+        .arg = (void *)"gc-stale-map", .edge.extra_device_opts = FEMU_TAG_GEO });
     qos_add_test("mbe-none-nossd", "femu", femu_test_mbe_none,
                  &(QOSGraphTestOptions) {
         .arg = (void *)"devsz_mb=64,femu_mode=2" });

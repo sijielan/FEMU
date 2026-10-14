@@ -293,6 +293,7 @@ struct line_mgmt {
 
 typedef struct buffer_entry {
     uint64_t lpn;
+    uint64_t tag;       /* tag_check: what programming the page will tag */
     uint8_t *undo;
     uint8_t *lba_state;
     QTAILQ_ENTRY(buffer_entry) b_entry;
@@ -637,6 +638,7 @@ struct ssd {
     /* FDP: 512-byte pieces of the FTL space the FTL holds as written */
     unsigned long *fdp_written;
     uint64_t fdp_written_bits;
+    struct ftl_tag *tag;    /* tag_check state, NULL when off; ftl-tag.c */
 };
 
 int bb_check_geometry(FemuCtrl *n, Error **errp);
@@ -707,5 +709,33 @@ uint64_t ssd_advance_copyback(struct ssd *ssd, struct ppa *src,
     if ((ssd)->fdp_debug) \
         fprintf(stderr, "[FEMU] FDP-Trace: " fmt, ## __VA_ARGS__); \
 } while (0)
+
+/*
+ * tag_check (hw/femu/bbssd/ftl-tag.c): the FTL keeps a tag with each
+ * physical page, as a device keeps the logical address in a page's spare
+ * area, and the I/O layer checks each read's tag against what NVMe allows.
+ */
+#define FTL_TAG_ERASED      UINT64_MAX          /* page erased, not written */
+#define FTL_TAG_UNMAPPED    (UINT64_MAX - 1)    /* read found no mapping */
+
+void ftl_tag_init(struct ssd *ssd);
+void ftl_tag_free(struct ssd *ssd);
+void ftl_tag_reset(struct ssd *ssd);
+uint64_t ftl_tag_value(struct ssd *ssd, NvmeRequest *req, uint64_t lpn);
+void ftl_tag_program(struct ssd *ssd, struct ppa *ppa, uint64_t tag);
+void ftl_tag_move(struct ssd *ssd, struct ppa *from, struct ppa *to);
+void ftl_tag_erase(struct ssd *ssd, struct ppa *blk);
+void ftl_tag_read(struct ssd *ssd, NvmeRequest *req, uint64_t lpn,
+                  struct ppa *ppa, uint64_t buffered);
+bool ftl_tag_inject(struct ssd *ssd, int point);
+
+/* fault injection points for qtest, to show the checker catches each */
+enum {
+    FTL_TAG_INJECT_NONE,
+    FTL_TAG_INJECT_SWALLOW_WRITE,   /* a host program is dropped */
+    FTL_TAG_INJECT_GC_STALE_MAP,    /* a relocation leaves the old mapping */
+    FTL_TAG_INJECT_TRIM_KEEP,       /* a deallocate leaves the mapping */
+    FTL_TAG_INJECT_MAP_NEIGHBOR,    /* a write maps the previous page's copy */
+};
 
 #endif

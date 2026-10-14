@@ -18,7 +18,8 @@ DEVICES = [
         "test_only": ["x-copy-held", "x-copy-hold", "x-fdp-check", "x-ftl-check",
                       "x-ftl-trace", "x-ns-test", "x-oc12-clock",
                       "x-oc12-trace", "x-query-delay-ms", "x-range-waits",
-                      "x-stream-test", "x-zone-lock-hold-ms"],
+                      "x-stream-test", "x-tag-inject", "x-tag-injected",
+                      "x-zone-lock-hold-ms"],
         "topics": [
             {
                 "title": "Mode, capacity and namespaces",
@@ -35,6 +36,13 @@ DEVICES = [
                 "props": [
                     "mbe_type", "mbe_file", "mbe_thp", "mbe_lock",
                     "mbe_pin_meta", "mbe_budget_mb", "mbe_prefetch",
+                ],
+            },
+            {
+                "title": "FTL tag checker (bbssd)",
+                "kind": "static",
+                "props": [
+                    "tag_check",
                 ],
             },
             {
@@ -185,6 +193,13 @@ DEVICES = [
                 "kind": "runtime",
                 "props": [
                     "mbe-resident", "mbe-evicted",
+                ],
+            },
+            {
+                "title": "FTL tag checker results",
+                "kind": "runtime",
+                "props": [
+                    "tag-checked", "tag-errors", "tag-skipped",
                 ],
             },
         ],

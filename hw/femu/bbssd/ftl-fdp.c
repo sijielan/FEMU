@@ -1476,6 +1476,9 @@ static uint64_t ssd_stream_write_lpns(FemuCtrl *n, struct ssd *ssd,
         ppa = fdp_get_new_page(ssd, ru);
         set_maptbl_ent(ssd, lpn, &ppa);
         set_rmap_ent(ssd, lpn, &ppa);
+        if (unlikely(ssd->tag)) {
+            ftl_tag_program(ssd, &ppa, ftl_tag_value(ssd, req, lpn));
+        }
         mark_page_valid_fdp(ssd, &ppa, ru);
         fdp_mark_written(ssd, req, slba, nlb, lpn);
         ssd->nand_write_pages++; /* a user page programmed into NAND */

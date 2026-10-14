@@ -518,6 +518,9 @@ void mark_block_free(struct ssd *ssd, struct ppa *ppa)
         pg = &blk->pg[i];
         pg->status = PG_FREE;
     }
+    if (unlikely(ssd->tag)) {
+        ftl_tag_erase(ssd, ppa);
+    }
 
     /* reset block status */
     ftl_assert(blk->npgs == spp->pgs_per_blk);
@@ -565,6 +568,12 @@ void ssd_gc_move_page(struct ssd *ssd, uint64_t lpn, struct ppa *old_ppa,
                       void *dest)
 {
     ssd->mapping->gc_relocate_commit(ssd, lpn, old_ppa, new_ppa);
+    if (unlikely(ssd->tag)) {
+        ftl_tag_move(ssd, old_ppa, new_ppa);
+        if (ftl_tag_inject(ssd, FTL_TAG_INJECT_GC_STALE_MAP)) {
+            set_maptbl_ent(ssd, lpn, old_ppa);
+        }
+    }
     ops->mark_invalid(ssd, old_ppa);
     set_rmap_ent(ssd, INVALID_LPN, old_ppa);
     ops->mark_valid(ssd, new_ppa, dest);

@@ -2624,6 +2624,39 @@ static bool femu_check_pd_props(FemuCtrl *n, Error **errp)
  * namespace modes are checked in nvme_init_namespaces().
  */
 /*
+ * tag_check follows a page through every place the bbssd FTL with a flat
+ * page map can put it. A log-block mapping scheme moves pages on paths of its
+ * own, the power loss model rolls back mappings the I/O layer cannot see,
+ * and a borrowed or shared FTL is fed by commands this controller does not
+ * fetch, so those are refused rather than checked wrongly.
+ */
+static bool femu_check_tag_props(FemuCtrl *n, Error **errp)
+{
+    const char *map = n->bb_params.mapping_scheme;
+
+    if (!n->tag_check) {
+        return true;
+    }
+    if (!BBSSD(n)) {
+        error_setg(errp, "femu: tag_check needs femu_mode=1 (bbssd)");
+        return false;
+    }
+    if (map && strcmp(map, "page") && strcmp(map, "dftl")) {
+        error_setg(errp, "femu: tag_check supports mapping=page and dftl, "
+                   "not %s", map);
+        return false;
+    }
+    if (n->power_loss || n->cxl_dev || nvme_ns_shared(n) ||
+        n->bb_params.fdp_trim_erase_all) {
+        error_setg(errp, "femu: tag_check cannot follow pages with "
+                   "power_loss, cxl_ssd, shared namespaces or "
+                   "fdp_trim_erase_all");
+        return false;
+    }
+    return true;
+}
+
+/*
  * mbe_type=none keeps no data, so only modes that keep everything else apart
  * from it can run on it: KV keys and CSD programs live in the data, an
  * Open-Channel host keeps its FTL there, and metadata, protection
@@ -2897,6 +2930,9 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
         return;
     }
     if (!femu_check_mbe_props(n, errp)) {
+        return;
+    }
+    if (!femu_check_tag_props(n, errp)) {
         return;
     }
 
@@ -3371,6 +3407,7 @@ static const Property femu_props[] = {
     DEFINE_PROP_BOOL("mbe_pin_meta", FemuCtrl, mbe_pin_meta, true),
     DEFINE_PROP_UINT64("mbe_budget_mb", FemuCtrl, mbe_budget_mb, 0),
     DEFINE_PROP_BOOL("mbe_prefetch", FemuCtrl, mbe_prefetch, true),
+    DEFINE_PROP_BOOL("tag_check", FemuCtrl, tag_check, false),
     DEFINE_PROP_UINT32("namespaces", FemuCtrl, num_namespaces, 1),
     DEFINE_PROP_UINT32("queues", FemuCtrl, nr_io_queues, 8),
     DEFINE_PROP_UINT32("entries", FemuCtrl, max_q_ents, 0x7ff),
@@ -3927,6 +3964,35 @@ static void femu_mbe_evicted_get(Object *obj, Visitor *v, const char *name,
     visit_type_uint64(v, name, &value, errp);
 }
 
+static void femu_tag_stat_get(Object *obj, Visitor *v, const char *name,
+                              void *opaque, Error **errp)
+{
+    uint64_t stat[4];
+
+    bbssd_tag_stats(FEMU(obj), &stat[0], &stat[1], &stat[2], &stat[3]);
+    visit_type_uint64(v, name, &stat[(uintptr_t)opaque], errp);
+}
+
+/* qtest only: have the bbssd FTL commit one fault, to show tag_check sees it */
+static void femu_test_tag_inject(Object *obj, const char *value, Error **errp)
+{
+    static const char *const points[] = {
+        [FTL_TAG_INJECT_NONE] = "none",
+        [FTL_TAG_INJECT_SWALLOW_WRITE] = "swallow-write",
+        [FTL_TAG_INJECT_GC_STALE_MAP] = "gc-stale-map",
+        [FTL_TAG_INJECT_TRIM_KEEP] = "trim-keep",
+        [FTL_TAG_INJECT_MAP_NEIGHBOR] = "map-neighbor",
+    };
+
+    for (int i = 0; i < ARRAY_SIZE(points); i++) {
+        if (!strcmp(value, points[i])) {
+            qatomic_set(&FEMU(obj)->tag_inject, i);
+            return;
+        }
+    }
+    error_setg(errp, "unknown tag_check injection point %s", value);
+}
+
 static void femu_instance_init(Object *obj)
 {
     object_property_add_bool(obj, "simulate-power-loss", NULL,
@@ -3935,6 +4001,12 @@ static void femu_instance_init(Object *obj)
                         NULL, NULL, NULL);
     object_property_add(obj, "mbe-evicted", "uint64", femu_mbe_evicted_get,
                         NULL, NULL, NULL);
+    object_property_add(obj, "tag-checked", "uint64", femu_tag_stat_get,
+                        NULL, NULL, (void *)0);
+    object_property_add(obj, "tag-errors", "uint64", femu_tag_stat_get,
+                        NULL, NULL, (void *)1);
+    object_property_add(obj, "tag-skipped", "uint64", femu_tag_stat_get,
+                        NULL, NULL, (void *)2);
     femu_ctrl_describe_runtime(obj);
     if (qtest_enabled()) {
         object_property_add_bool(obj, "x-oc12-clock", NULL,
@@ -3959,6 +4031,10 @@ static void femu_instance_init(Object *obj)
                             femu_test_range_waits_get, NULL, NULL, NULL);
         object_property_add_str(obj, "x-oc12-trace", femu_test_oc12_trace,
                                 NULL);
+        object_property_add_str(obj, "x-tag-inject", NULL,
+                                femu_test_tag_inject);
+        object_property_add(obj, "x-tag-injected", "uint64",
+                            femu_tag_stat_get, NULL, NULL, (void *)3);
     }
 }
 

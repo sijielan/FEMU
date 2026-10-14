@@ -1681,6 +1681,7 @@ typedef struct NvmeRequest {
     struct NvmeSQueue       *sq;
     struct NvmeCQueue       *cq;
     struct NvmeNamespace    *ns;
+    void                    *tag;   /* tag_check state, bbssd/ftl-tag.c */
     uint8_t                 *write_data; /* power-loss model, FTL owned */
     uint16_t                status;
     uint64_t                slba;
@@ -2419,6 +2420,8 @@ typedef struct FemuCtrl {
     bool            mbe_pin_meta;
     uint64_t        mbe_budget_mb;
     bool            mbe_prefetch;
+    bool            tag_check;  /* check bbssd reads against FTL tags */
+    int             tag_inject; /* qtest: FTL_TAG_INJECT_* to fire once */
     FemuMbeConfig   mbe_cfg;    /* the above, parsed at realize */
     uint32_t        read_cache_mb; /* bbssd DRAM read cache size (0 = off) */
     uint32_t        mapping_cache_mb; /* bbssd DFTL translation cache size (0 = off) */
@@ -2885,8 +2888,17 @@ void     nvme_addr_write(FemuCtrl *n, hwaddr addr, void *buf, int size);
  * it once the ranges are applied, the others never did. Release whatever is
  * still attached when the request goes back on the free list.
  */
+void bbssd_tag_fetch(FemuCtrl *n, NvmeRequest *req);
+void bbssd_tag_complete(FemuCtrl *n, NvmeRequest *req);
+void bbssd_tag_release(NvmeRequest *req);
+void bbssd_tag_stats(FemuCtrl *n, uint64_t *checked, uint64_t *errors,
+                     uint64_t *skipped, uint64_t *injected);
+
 static inline void nvme_req_release_ranges(NvmeRequest *req)
 {
+    if (req->tag) {
+        bbssd_tag_release(req);
+    }
     g_free(req->dsm_ranges);
     req->dsm_ranges = NULL;
     req->dsm_nr_ranges = 0;

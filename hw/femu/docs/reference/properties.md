@@ -22,7 +22,7 @@ Devices:
 
 ## `femu`: NVMe controller
 
-`-device femu` has 193 properties of its own and 3 QOM properties listed in [runtime-properties.md](runtime-properties.md).
+`-device femu` has 194 properties of its own and 6 QOM properties listed in [runtime-properties.md](runtime-properties.md).
 
 ### Mode, capacity and namespaces
 
@@ -50,6 +50,12 @@ Devices:
 | `mbe_pin_meta` | `bool` | `on` | mbe_type=sparse or file: pin all process memory other than the backend data as it is touched (mlockall), so FTL metadata and FEMU threads never page out; needs RLIMIT_MEMLOCK unlimited, off only for unprivileged runs |
 | `mbe_budget_mb` | `uint64` | `0` | mbe_type=sparse or file: MiB of backend data to keep in host memory; a background thread evicts the least recently used 2 MiB chunks above it, sparse ones to swap (which the host must have); 0 (the default) evicts nothing |
 | `mbe_prefetch` | `bool` | `on` | mbe_type=sparse or file: before a poller runs the reads waiting in a queue, ask the host for all their data at once (MADV_WILLNEED), so reads that miss host memory wait together rather than one by one; on by default |
+
+### FTL tag checker (bbssd)
+
+| Property | Type | Default | Description |
+| --- | --- | --- | --- |
+| `tag_check` | `bool` | `off` | bbssd: keep a tag (logical page, version) with each NAND page and check every read against the versions NVMe allows, catching mapping, collection and deallocate bugs the data does not show; mapping=page or dftl, not with power_loss; off by default |
 
 ### Queues, pollers and interrupts
 
@@ -397,7 +403,7 @@ QEMU's internal compatibility properties (`x-max-bounce-buffer-size`, `x-pcie-ar
 
 These exist only when QEMU runs under qtest (`-accel qtest`) and serve FEMU's own tests. They are not part of the user interface.
 
-- `femu`: `x-copy-held`, `x-copy-hold`, `x-fdp-check`, `x-ftl-check`, `x-ftl-trace`, `x-ns-test`, `x-oc12-clock`, `x-oc12-trace`, `x-query-delay-ms`, `x-range-waits`, `x-stream-test`, `x-zone-lock-hold-ms`
+- `femu`: `x-copy-held`, `x-copy-hold`, `x-fdp-check`, `x-ftl-check`, `x-ftl-trace`, `x-ns-test`, `x-oc12-clock`, `x-oc12-trace`, `x-query-delay-ms`, `x-range-waits`, `x-stream-test`, `x-tag-inject`, `x-tag-injected`, `x-zone-lock-hold-ms`
 - `femu-cxl-ssd`: `test-change-dpa`, `test-fault`, `test-fault-decode`, `test-fault-delivery`, `test-fault-fill`, `test-fault-repeats`, `test-fault-version`, `test-fault-walk`, `test-fill`, `test-fill-race`, `test-ftl-delay`, `test-ftl-hold`, `test-ftl-holding`, `test-guarded-write`, `test-lock-mutex`, `test-lock-wanted`, `test-map`, `test-media-disabled`, `test-nvme-after-posted`, `test-owner`, `test-posted-done`, `test-prefetch-race`, `test-prefetch-race-end`, `test-protect`, `test-protect-window`, `test-revoke-ahead`, `test-revoke-ahead-keep`, `test-rip`, `test-slot-reservation`, `test-storm`, `test-storm-ns`, `test-storm-served`, `test-storm-stops`, `test-storm-wait`, `test-thread-read`, `test-unprotect`
 
 ## Environment variables

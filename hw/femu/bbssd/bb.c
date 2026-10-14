@@ -226,6 +226,9 @@ static void bb_init(FemuCtrl *n, NvmeNamespace *ns, Error **errp)
     ssd->ssdname = (char *)n->devname;
     femu_debug("Starting FEMU in Blackbox-SSD mode ...\n");
     ssd_init(n, ns);
+    if (n->tag_check) {
+        ftl_tag_init(ssd);
+    }
 }
 
 /*

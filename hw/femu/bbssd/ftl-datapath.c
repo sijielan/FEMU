@@ -99,7 +99,8 @@ static int buffer_destage_batch(struct ssd *ssd)
 }
 
 /* take the least recently written page out of the buffer */
-static bool buffer_select_victim(struct ssd *ssd, uint64_t *lpn)
+static bool buffer_select_victim(struct ssd *ssd, uint64_t *lpn,
+                                 uint64_t *tag)
 {
     struct buffer_entry *victim = QTAILQ_FIRST(&ssd->write_buffer);
 
@@ -108,6 +109,7 @@ static bool buffer_select_victim(struct ssd *ssd, uint64_t *lpn)
     }
 
     *lpn = victim->lpn;
+    *tag = victim->tag;
     QTAILQ_REMOVE(&ssd->write_buffer, victim, b_entry);
     g_tree_remove(ssd->wb_tree, victim);
     g_free(victim->undo);
@@ -124,13 +126,14 @@ static bool buffer_select_victim(struct ssd *ssd, uint64_t *lpn)
  * no extra program is owed. A page that is already held keeps its identity and
  * is only moved to the tail, so occupancy cannot grow on a repeat write.
  */
-static bool buffer_insert(struct ssd *ssd, uint64_t lpn)
+static bool buffer_insert(struct ssd *ssd, uint64_t lpn, uint64_t tag)
 {
     struct buffer_entry target = { .lpn = lpn };
     struct buffer_entry *held = g_tree_lookup(ssd->wb_tree, &target);
     struct buffer_entry *entry;
 
     if (held) {
+        held->tag = tag;
         QTAILQ_REMOVE(&ssd->write_buffer, held, b_entry);
         QTAILQ_INSERT_TAIL(&ssd->write_buffer, held, b_entry);
         return true;
@@ -138,6 +141,7 @@ static bool buffer_insert(struct ssd *ssd, uint64_t lpn)
 
     entry = g_new0(struct buffer_entry, 1);
     entry->lpn = lpn;
+    entry->tag = tag;
     g_tree_insert(ssd->wb_tree, entry, entry);
     QTAILQ_INSERT_TAIL(&ssd->write_buffer, entry, b_entry);
     ssd->write_buffer_cnt++;
@@ -172,12 +176,18 @@ static void buffer_discard(struct ssd *ssd, uint64_t lpn)
     ssd->write_buffer_cnt--;
 }
 
-/* a read served from the buffer does not reach the media */
-static bool buffer_hit(struct ssd *ssd, uint64_t lpn)
+/* the buffer's entry for @lpn, if it holds one */
+static struct buffer_entry *buffer_lookup(struct ssd *ssd, uint64_t lpn)
 {
     struct buffer_entry target = { .lpn = lpn };
 
-    return g_tree_lookup(ssd->wb_tree, &target) != NULL;
+    return g_tree_lookup(ssd->wb_tree, &target);
+}
+
+/* a read served from the buffer does not reach the media */
+static bool buffer_hit(struct ssd *ssd, uint64_t lpn)
+{
+    return buffer_lookup(ssd, lpn) != NULL;
 }
 
 /*
@@ -475,12 +485,17 @@ static uint64_t ssd_mp_flush(struct ssd *ssd, int cmd)
  * the eviction of a buffered page, so both cost the same.
  */
 static uint64_t ssd_program_lpn(struct ssd *ssd, uint64_t lpn, uint64_t stime,
-                               int stream)
+                               int stream, uint64_t tag)
 {
     struct map_write_plan plan;
     struct nand_cmd swr;
     struct ppa ppa;
     uint64_t lat;
+
+    if (unlikely(ssd->tag) &&
+        ftl_tag_inject(ssd, FTL_TAG_INJECT_SWALLOW_WRITE)) {
+        return 0;
+    }
 
     /* log the overwrite before commit_write invalidates the old mapping */
     if (exp_lpn_watched(lpn)) {
@@ -505,6 +520,16 @@ static uint64_t ssd_program_lpn(struct ssd *ssd, uint64_t lpn, uint64_t stime,
         ppa = get_new_page_class(ssd, plan.target_class);
     }
     ssd->mapping->commit_write(ssd, lpn, &ppa);
+    if (unlikely(ssd->tag)) {
+        ftl_tag_program(ssd, &ppa, tag);
+        if (lpn && ftl_tag_inject(ssd, FTL_TAG_INJECT_MAP_NEIGHBOR)) {
+            struct ppa prev = get_maptbl_ent(ssd, lpn - 1);
+
+            if (mapped_ppa(&prev)) {
+                set_maptbl_ent(ssd, lpn, &prev);
+            }
+        }
+    }
 
     mark_page_valid(ssd, &ppa);
     ssd->nand_write_pages++; /* write amplification: a user page programmed */
@@ -584,7 +609,7 @@ static uint64_t ssd_gc_until_clear(struct ssd *ssd)
 uint64_t ssd_buffer_destage(struct ssd *ssd, int budget, uint64_t stime)
 {
     uint64_t maxlat = 0, curlat;
-    uint64_t lpn;
+    uint64_t lpn, tag;
     int done = 0;
 
     while (budget <= 0 || done < budget) {
@@ -613,7 +638,7 @@ uint64_t ssd_buffer_destage(struct ssd *ssd, int budget, uint64_t stime)
             break;
         }
 
-        if (!buffer_select_victim(ssd, &lpn)) {
+        if (!buffer_select_victim(ssd, &lpn, &tag)) {
             break;
         }
 
@@ -623,7 +648,7 @@ uint64_t ssd_buffer_destage(struct ssd *ssd, int budget, uint64_t stime)
             maxlat = (curlat > maxlat) ? curlat : maxlat;
         }
 
-        curlat = ssd_program_lpn(ssd, lpn, stime, -1);
+        curlat = ssd_program_lpn(ssd, lpn, stime, -1, tag);
         maxlat = (curlat > maxlat) ? curlat : maxlat;
         done++;
     }
@@ -672,6 +697,10 @@ uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
          * be holding pages that have not been written back yet.
          */
         if (ssd->write_buffer_cnt && buffer_hit(ssd, lpn)) {
+            if (unlikely(ssd->tag)) {
+                ftl_tag_read(ssd, req, lpn, NULL,
+                             buffer_lookup(ssd, lpn)->tag);
+            }
             sublat = buffer_hit_lat(ssd);
             maxlat = (sublat > maxlat) ? sublat : maxlat;
             ssd->sp.read_hit_cnt++;
@@ -689,6 +718,9 @@ uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
         }
 
         ppa = ssd->mapping->translate(ssd, lpn);
+        if (unlikely(ssd->tag)) {
+            ftl_tag_read(ssd, req, lpn, &ppa, 0);
+        }
         if (!mapped_ppa(&ppa) || !valid_ppa(ssd, &ppa)) {
             //printf("%s,lpn(%" PRId64 ") not mapped to valid ppa\n", ssd->ssdname, lpn);
             //printf("Invalid ppa,ch:%d,lun:%d,blk:%d,pl:%d,pg:%d,sec:%d\n",
@@ -809,7 +841,7 @@ uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
                 }
             }
 
-            if (buffer_insert(ssd, lpn)) {
+            if (buffer_insert(ssd, lpn, ftl_tag_value(ssd, req, lpn))) {
                 ssd->sp.write_hit_cnt++;
             }
             buffer_write_data(ssd, req, lpn, true);
@@ -882,7 +914,8 @@ uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
             buffer_discard(ssd, lpn);
         }
         buffer_write_data(ssd, req, lpn, false);
-        curlat = ssd_program_lpn(ssd, lpn, req->stime, stream);
+        curlat = ssd_program_lpn(ssd, lpn, req->stime, stream,
+                                 ftl_tag_value(ssd, req, lpn));
         maxlat = (curlat > maxlat) ? curlat : maxlat;
 
         /*
@@ -950,6 +983,10 @@ static int ssd_deallocate_lpns(struct ssd *ssd, uint64_t start_lpn,
         /* nothing mapped to invalidate; the buffer entry is already gone */
         if (!mapped_ppa(&ppa) || !valid_ppa(ssd, &ppa)) {
             (*already_invalid)++;
+            continue;
+        }
+        if (unlikely(ssd->tag) &&
+            ftl_tag_inject(ssd, FTL_TAG_INJECT_TRIM_KEEP)) {
             continue;
         }
 
@@ -1050,7 +1087,8 @@ uint64_t ssd_write_zeroes(struct ssd *ssd, NvmeRequest *req)
                 req->status = NVME_CAP_EXCEEDED | NVME_DNR;
                 break;
             }
-            curlat = ssd_program_lpn(ssd, lpn, req->stime, -1);
+            curlat = ssd_program_lpn(ssd, lpn, req->stime, -1,
+                                     ftl_tag_value(ssd, req, lpn));
             maxlat = (curlat > maxlat) ? curlat : maxlat;
             /* the pages are programmed, so wear levelling sees them too */
             if (spp->wl_spread) {
@@ -1091,6 +1129,7 @@ void bbssd_deallocate_all(NvmeNamespace *ns)
     if (!ssd || !ssd->sp.tt_pgs) {
         return;
     }
+    ftl_tag_reset(ssd);
     if (ssd->fdp_enabled) {
         ssd_deallocate_fdp_all(ssd);
     } else {

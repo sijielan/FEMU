@@ -832,6 +832,7 @@ void ssd_free(struct ssd *ssd)
     if (!ssd) {
         return;
     }
+    ftl_tag_free(ssd);
     spp = &ssd->sp;
 
     /*

@@ -101,6 +101,11 @@ static const FemuPropDesc femu_ctrl_descs[] = {
       "queue, ask the host for all their data at once (MADV_WILLNEED), so "
       "reads that miss host memory wait together rather than one by one; "
       "on by default" },
+    { "tag_check",
+      "bbssd: keep a tag (logical page, version) with each NAND page and "
+      "check every read against the versions NVMe allows, catching mapping, "
+      "collection and deallocate bugs the data does not show; mapping=page "
+      "or dftl, not with power_loss; off by default" },
     { "namespaces",
       "Number of namespaces created at boot, 1 to 256; OCSSD and FDP "
       "support only 1" },
@@ -748,6 +753,14 @@ static const FemuPropDesc femu_ctrl_runtime_descs[] = {
     { "mbe-resident",
       "Read-only: bytes of the memory backend now in host memory; for "
       "mbe_type=file, the pages of mbe_file in the page cache" },
+    { "tag-checked",
+      "Read-only: logical pages tag_check has checked on read" },
+    { "tag-errors",
+      "Read-only: reads tag_check found wrong; the first are logged with "
+      "their logical and physical page" },
+    { "tag-skipped",
+      "Read-only: logical pages read that tag_check could not check, as "
+      "their last change was a Copy or failed" },
     { "mbe-evicted",
       "Read-only: bytes of backend data the mbe_budget_mb thread has taken "
       "out of host memory since realize" },
